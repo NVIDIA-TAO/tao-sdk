@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvidia-tao-sdk"
+version = "0.4.0"
+description = "NVIDIA TAO Execution SDK — agentic fine-tuning interface for GPU training. Single wheel; platform support is pulled in via extras."
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",   # versions.yaml resolver
+]
+
+[project.optional-dependencies]
+# Brev handler ships in the wheel and shells out to the brev CLI binary.
+# No extra Python deps; this extra exists for naming symmetry and future
+# optional Python deps.
+brev = []
+# Local Docker handler — uses the official docker Python client.
+docker = ["docker>=6.0"]
+# SLURM handler — SSH-based; stdlib only, no extra Python deps.
+slurm = []
+# Kubernetes handler — uses the official kubernetes Python client.
+kubernetes = ["kubernetes>=28.0"]
+# Convenience meta-extra.
+all = ["nvidia-tao-sdk[brev,docker,slurm,kubernetes]"]
+dev = [
+    "nvidia-tao-sdk[all]",
+    "pytest>=7.0",
+]
+
+[project.entry-points."tao_sdk.platforms"]
+brev       = "tao_sdk.platforms.brev:BrevHandler"
+docker     = "tao_sdk.platforms.docker:DockerHandler"
+slurm      = "tao_sdk.platforms.slurm:SlurmHandler"
+kubernetes = "tao_sdk.platforms.kubernetes:KubernetesHandler"
+
+[tool.setuptools.packages.find]
+include = ["tao_sdk*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tao_sdk/tests"]
