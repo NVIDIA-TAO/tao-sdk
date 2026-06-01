@@ -144,4 +144,3 @@ tao-sdk/
 ## Related repos
 
 - [**tao-skills-external**](https://github.com/NVIDIA-TAO/tao-skills-bank) — the skill bank (primary artifact; plugin marketplace)
-- [**tao-skill-marketplace**](https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-skills/tao-skill-marketplace) — team-wide Claude Code plugin marketplace
