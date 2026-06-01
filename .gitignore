@@ -1,0 +1,32 @@
+# Credentials — never commit
+secrets.json
+
+# Session state
+tao_session_state.json
+tao_session_state.db
+tao_session_state.db-shm
+tao_session_state.db-wal
+job_plan.json
+*_plan.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.env

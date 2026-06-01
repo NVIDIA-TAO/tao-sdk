@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tao-sdk"
+version = "0.2.0"
+description = "Deprecated alias for nvidia-tao-sdk. Install 'nvidia-tao-sdk' instead."
+requires-python = ">=3.10"
+dependencies = [
+    "nvidia-tao-sdk>=0.2.0",
+]
+
+[project.optional-dependencies]
+lepton = ["nvidia-tao-sdk[lepton]>=0.2.0"]
+brev   = ["nvidia-tao-sdk[brev]>=0.2.0"]
+all    = ["nvidia-tao-sdk[all]>=0.2.0"]
+
+[tool.setuptools]
+py-modules = []
