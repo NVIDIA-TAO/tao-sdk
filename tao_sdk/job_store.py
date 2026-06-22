@@ -17,6 +17,8 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tao_sdk.checkpoints import build_checkpoint_candidate, select_checkpoint_path
+
 logger = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -234,6 +236,33 @@ class JobStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_checkpoint_path(
+        self,
+        job_id: str,
+        *,
+        model_name: str | None = None,
+        epoch: int | None = None,
+        step: int | None = None,
+        action: str = "resume",
+        prefer_directory: bool = False,
+        allow_latest: bool = False,
+    ) -> str | None:
+        """Resolve a checkpoint path for a job/action at an epoch or step."""
+        candidates = [
+            build_checkpoint_candidate(row["path"])
+            for row in self.get_checkpoints(job_id)
+            if row.get("path")
+        ]
+        return select_checkpoint_path(
+            candidates,
+            model_name=model_name,
+            epoch=epoch,
+            step=step,
+            action=action,
+            prefer_directory=prefer_directory,
+            allow_latest=allow_latest,
+        )
+
     # ------------------------------------------------------------------
     # Job chain queries
     # ------------------------------------------------------------------
@@ -248,16 +277,27 @@ class JobStore:
         ).fetchone()
         return dict(row) if row else None
 
-    def get_parent_model_path(self, job_id: str) -> str:
-        """Get the latest checkpoint path from the parent job."""
-        row = self._conn.execute(
-            """SELECT cp.path FROM checkpoints cp
-               JOIN jobs c ON c.parent_job_id = cp.job_id
-               WHERE c.job_id = ?
-               ORDER BY cp.epoch DESC LIMIT 1""",
-            (job_id,),
-        ).fetchone()
-        return row["path"] if row else ""
+    def get_parent_model_path(
+        self,
+        job_id: str,
+        *,
+        epoch: int | None = None,
+        step: int | None = None,
+        action: str = "resume",
+    ) -> str:
+        """Resolve a checkpoint path from the parent job."""
+        parent = self.get_parent_job(job_id)
+        if not parent:
+            return ""
+        path = self.get_checkpoint_path(
+            parent["job_id"],
+            model_name=parent.get("network_arch"),
+            epoch=epoch,
+            step=step,
+            action=action,
+            allow_latest=epoch is None and step is None,
+        )
+        return path or ""
 
     def get_parent_results_dir(self, job_id: str) -> str:
         """Get the results_dir from the parent job."""
@@ -287,7 +327,7 @@ class JobStore:
         return job["results_dir"] if job else None
 
     def _infer_resume_model(self, job_id: str) -> str | None:
-        """Latest checkpoint path from the parent job."""
+        """Checkpoint path from the parent job."""
         return self.get_parent_model_path(job_id) or None
 
     def _infer_resume_model_bool(self, job_id: str) -> str | None:

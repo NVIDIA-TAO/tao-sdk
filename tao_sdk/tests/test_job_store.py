@@ -126,6 +126,29 @@ class TestCheckpoints:
         cp = store.get_latest_checkpoint("j-1")
         assert cp["format"] == "pth"
 
+    def test_checkpoint_path_prefers_requested_epoch_over_latest(self, store):
+        store.create_job("j-1", "classification-pyt", "train", "ws-1")
+        store.add_checkpoint("j-1", "/results/j-1/train/classifier_model_latest.pth", epoch=1)
+        store.add_checkpoint("j-1", "/results/j-1/train/model_epoch_001.pth", epoch=1)
+        assert (
+            store.get_checkpoint_path("j-1", model_name="classification-pyt", epoch=1)
+            == "/results/j-1/train/model_epoch_001.pth"
+        )
+
+    def test_checkpoint_path_matches_zero_indexed_epoch_file(self, store):
+        store.create_job("j-1", "depth-net-stereo", "train", "ws-1")
+        store.add_checkpoint("j-1", "/results/j-1/train/dn_model_latest.pth", epoch=1)
+        store.add_checkpoint("j-1", "/results/j-1/train/model_epoch_000_step_00014.pth", epoch=1)
+        assert (
+            store.get_checkpoint_path("j-1", model_name="depth-net-stereo", epoch=1)
+            == "/results/j-1/train/model_epoch_000_step_00014.pth"
+        )
+
+    def test_checkpoint_path_returns_none_for_requested_epoch_without_match(self, store):
+        store.create_job("j-1", "clip", "train", "ws-1")
+        store.add_checkpoint("j-1", "/results/j-1/train/model_latest.pth", epoch=3)
+        assert store.get_checkpoint_path("j-1", model_name="clip", epoch=1) is None
+
 
 # ---------------------------------------------------------------------------
 # Job chain queries

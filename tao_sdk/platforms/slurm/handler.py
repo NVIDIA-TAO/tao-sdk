@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import time
 import traceback
+import fcntl
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1531,17 +1532,40 @@ class SlurmHandler(BaseHandler):
             self._save_state()
 
     def _load_state(self) -> dict[str, dict[str, Any]]:
+        lock_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".lock")
         try:
-            if STATE_PATH.exists():
-                loaded = json.loads(STATE_PATH.read_text())
-                if isinstance(loaded, dict):
-                    return loaded
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("w") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_SH)
+                if STATE_PATH.exists():
+                    loaded = json.loads(STATE_PATH.read_text())
+                    if isinstance(loaded, dict):
+                        return loaded
         except Exception as exc:
             logger.warning("Failed to read SLURM state file %s: %s", STATE_PATH, exc)
         return {}
 
     def _save_state(self) -> None:
+        lock_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".lock")
+        tmp_path = STATE_PATH.with_name(f"{STATE_PATH.name}.{os.getpid()}.tmp")
         try:
-            STATE_PATH.write_text(json.dumps(self._jobs, indent=2, sort_keys=True))
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("w") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                existing = {}
+                if STATE_PATH.exists():
+                    try:
+                        loaded = json.loads(STATE_PATH.read_text())
+                        if isinstance(loaded, dict):
+                            existing = loaded
+                    except Exception:
+                        logger.warning("Ignoring unreadable SLURM state file during save: %s", STATE_PATH)
+                existing.update(self._jobs)
+                tmp_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
+                os.replace(tmp_path, STATE_PATH)
         except Exception as exc:
             logger.warning("Failed to write SLURM state file %s: %s", STATE_PATH, exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass

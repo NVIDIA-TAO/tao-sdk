@@ -10,6 +10,7 @@ in the legacy test file imported alongside the handler when needed.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -83,3 +84,41 @@ def test_docker_results_root_prefix_ignores_other_mounts():
     sdk = object.__new__(DockerSDK)
     mounts = [{"host_path": "/host/data", "container_path": "/data"}]
     assert sdk._results_root_prefix(mounts=mounts) is None
+
+
+# ---------------------------------------------------------------------------
+# Docker network prereq
+# ---------------------------------------------------------------------------
+
+def _network_test_handler():
+    from tao_sdk.platforms.docker.handler import DockerHandler
+
+    class NotFound(Exception):
+        pass
+
+    handler = DockerHandler.__new__(DockerHandler)
+    handler.docker_network = "tao_default"
+    handler._docker = SimpleNamespace(errors=SimpleNamespace(NotFound=NotFound))
+    handler._client = MagicMock()
+    handler._job_messages = {}
+    handler._jobs = {}
+    return handler, NotFound
+
+
+def test_docker_handler_creates_missing_network():
+    handler, NotFound = _network_test_handler()
+    handler._client.networks.get.side_effect = NotFound("missing")
+
+    handler._ensure_network("job-1")
+
+    handler._client.networks.create.assert_called_once_with("tao_default")
+    assert handler.get_job_message("job-1") == "Creating Docker network tao_default"
+
+
+def test_docker_handler_does_not_create_existing_network():
+    handler, _ = _network_test_handler()
+    handler._client.networks.get.return_value = object()
+
+    handler._ensure_network("job-1")
+
+    handler._client.networks.create.assert_not_called()

@@ -27,6 +27,12 @@ all = ["nvidia-tao-sdk[brev,docker,slurm,kubernetes]"]
 dev = [
     "nvidia-tao-sdk[all]",
     "pytest>=7.0",
+    # Test-only: the in-container runtime helpers (download/upload) use fsspec,
+    # and test_script_runner.py patches `fsspec.core.url_to_fs`, which requires
+    # the real fsspec module to be importable. fsspec is deliberately NOT a
+    # runtime dependency — the container pip-installs it via _DEFAULT_INSTALL_DEPS
+    # (see script_runner.py), and build_entrypoint never touches it.
+    "fsspec",
 ]
 
 [project.entry-points."tao_sdk.platforms"]

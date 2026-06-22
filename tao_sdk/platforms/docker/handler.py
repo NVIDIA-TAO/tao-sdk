@@ -164,6 +164,7 @@ class DockerHandler(BaseHandler):
         self._update_job_status(job_id, "Pending", f"Preparing Docker image {image}")
         self._ensure_image(image, job_id)
         self._remove_existing_container(container_name)
+        self._ensure_network(job_id)
 
         run_kwargs = {
             "image": image,
@@ -466,6 +467,43 @@ class DockerHandler(BaseHandler):
             self._client.ping()
         except AttributeError:
             return
+
+    def _ensure_network(self, job_id: str):
+        """Ensure the configured Docker network exists before container launch."""
+        if not self.docker_network:
+            return
+
+        try:
+            self._client.networks.get(self.docker_network)
+            return
+        except AttributeError:
+            logger.debug("Docker client has no networks API; skipping network precheck")
+            return
+        except self._not_found_errors:
+            pass
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to inspect Docker network {self.docker_network!r}: {e}"
+            ) from e
+
+        self._update_job_status(
+            job_id,
+            "Pending",
+            f"Creating Docker network {self.docker_network}",
+        )
+        try:
+            self._client.networks.create(self.docker_network)
+        except Exception as e:
+            # If a concurrent launcher created it after our miss, treat that as
+            # success. Otherwise surface a clear pre-launch failure.
+            try:
+                self._client.networks.get(self.docker_network)
+                return
+            except Exception:
+                raise RuntimeError(
+                    f"Docker network {self.docker_network!r} does not exist "
+                    f"and could not be created: {e}"
+                ) from e
 
     def _ensure_image(self, image: str, job_id: str):
         if self.pull_policy == "never":
