@@ -99,6 +99,8 @@ def test_pip_install_line_present():
     ep = build_entrypoint(command="x")
     assert "pip install" in ep["command"]
     assert "fsspec" in ep["command"]
+    assert "fsspec>=2024.6.0" in ep["command"]
+    assert "s3fs>=2024.6.0" in ep["command"]
     assert "huggingface_hub" in ep["command"]
 
 

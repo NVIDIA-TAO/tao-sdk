@@ -27,7 +27,17 @@ import sys
 import uuid
 from pathlib import Path
 
-import fsspec
+try:
+    import fsspec
+except ImportError:
+    # fsspec is a container-runtime dependency (installed via _DEFAULT_INSTALL_DEPS
+    # inside the job container, where this module is inlined via heredoc). It is
+    # deliberately not an SDK dependency: the SDK process only calls
+    # build_entrypoint, which never touches fsspec. Bind the name so the module
+    # imports in environments without fsspec (dev, CI, downstream like tao-automl).
+    # The in-container runtime helpers that use it will fail clearly if it is
+    # genuinely absent at runtime.
+    fsspec = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -287,6 +297,22 @@ def _parse_selective_config(input_cfg: dict) -> tuple[str | None, str, list[str]
     )
 
 
+def _input_local_base(
+    results_dir: str,
+    spec_key: str,
+    input_cfg: dict,
+    idx: int | None = None,
+) -> str:
+    """Return the local/container base path for a spec input."""
+    configured = input_cfg.get("container_path") if isinstance(input_cfg, dict) else None
+    if configured:
+        return os.path.join(configured, str(idx)) if idx is not None else configured
+    parts = [results_dir, "inputs", spec_key.replace(".", "_")]
+    if idx is not None:
+        parts.append(str(idx))
+    return os.path.join(*parts)
+
+
 def download_file(remote_path: str, local_path: str):
     """Download a single file from S3 to local."""
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -312,7 +338,7 @@ def _strip_archive_suffix(path: str) -> str:
     return path
 
 
-def extract_archive(tar_path: str, dest_dir: str):
+def extract_archive(tar_path: str, dest_dir: str, extract_to_parent: bool = False):
     """Extract a tar/tar.gz archive into a folder named after the archive.
 
     Idempotent via a sibling `<tar_path>.extracted` marker. Uses the tarfile
@@ -326,7 +352,11 @@ def extract_archive(tar_path: str, dest_dir: str):
     """
     import tarfile
     marker = tar_path + ".extracted"
-    output_dir = os.path.join(dest_dir, os.path.basename(_strip_archive_suffix(tar_path)))
+    output_dir = (
+        dest_dir
+        if extract_to_parent
+        else os.path.join(dest_dir, os.path.basename(_strip_archive_suffix(tar_path)))
+    )
 
     if os.path.exists(marker) and os.path.isdir(output_dir) and os.listdir(output_dir):
         logger.info("Archive already extracted: %s", tar_path)
@@ -348,7 +378,12 @@ def extract_archive(tar_path: str, dest_dir: str):
             raw_name = member.name.strip("/")
             if not raw_name:
                 continue
-            rel_name = raw_name.split("/", 1)[1] if strip_root and "/" in raw_name else raw_name
+            if strip_root:
+                if raw_name == archive_root:
+                    continue
+                rel_name = raw_name.split("/", 1)[1] if raw_name.startswith(archive_root + "/") else raw_name
+            else:
+                rel_name = raw_name
             if not rel_name:
                 continue
             rel_path = os.path.normpath(rel_name)
@@ -375,12 +410,12 @@ def extract_archive(tar_path: str, dest_dir: str):
     logger.info("Extraction complete: %s", tar_path)
 
 
-def extract_archives_in_dir(directory: str):
+def extract_archives_in_dir(directory: str, extract_to_parent: bool = False):
     """Walk a directory and extract any tar/tar.gz files in place."""
     for root, _, files in os.walk(directory):
         for f in files:
             if _is_archive(f):
-                extract_archive(os.path.join(root, f), root)
+                extract_archive(os.path.join(root, f), root, extract_to_parent=extract_to_parent)
 
 
 def download_folder(remote_path: str, local_path: str):
@@ -573,6 +608,37 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
 
     for spec_key, input_cfg in input_keys.items():
         remote_path = _get_nested(specs, spec_key)
+        if isinstance(remote_path, list):
+            final_paths = []
+            for idx, item in enumerate(remote_path):
+                if not item or not _is_remote(item):
+                    final_paths.append(item)
+                    continue
+                local_base = _input_local_base(results_dir, spec_key, input_cfg, idx)
+                try:
+                    fs, _ = fsspec.core.url_to_fs(item)
+                    remote_key = item.split("://", 1)[1]
+                    input_type = "folder" if fs.isdir(remote_key) else "file"
+                except Exception:
+                    input_type = "folder" if item.endswith("/") else "file"
+                if input_type == "file":
+                    fname = os.path.basename(item.rstrip("/"))
+                    local_file = os.path.join(local_base, fname)
+                    download_file(item, local_file)
+                    final_path = local_file
+                    if _is_archive(local_file):
+                        extract_archive(local_file, os.path.dirname(local_file))
+                        final_path = _strip_archive_suffix(local_file)
+                    final_paths.append(final_path)
+                else:
+                    download_folder(item, local_base)
+                    extract_archives_in_dir(
+                        local_base,
+                        extract_to_parent=bool(input_cfg.get("extract_to_parent")),
+                    )
+                    final_paths.append(local_base)
+            _set_nested(specs, spec_key, final_paths)
+            continue
         if not remote_path or not _is_remote(remote_path):
             continue
 
@@ -625,17 +691,23 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
                 else:
                     if os.path.exists(lustre_path) and os.listdir(lustre_path):
                         logger.info("Lustre hit (folder): %s", lustre_path)
-                        extract_archives_in_dir(lustre_path)
+                        extract_archives_in_dir(
+                            lustre_path,
+                            extract_to_parent=bool(input_cfg.get("extract_to_parent")),
+                        )
                         _set_nested(specs, spec_key, lustre_path)
                         continue
                     logger.info("Lustre miss (folder), downloading: %s → %s", remote_path, lustre_path)
                     download_folder(remote_path, lustre_path)
-                extract_archives_in_dir(lustre_path)
+                extract_archives_in_dir(
+                    lustre_path,
+                    extract_to_parent=bool(input_cfg.get("extract_to_parent")),
+                )
                 _set_nested(specs, spec_key, lustre_path)
                 continue
 
         # No mount: download to container-local disk
-        local_base = os.path.join(results_dir, "inputs", spec_key.replace(".", "_"))
+        local_base = _input_local_base(results_dir, spec_key, input_cfg)
 
         if input_type == "file":
             fname = os.path.basename(remote_path.rstrip("/"))
@@ -658,7 +730,10 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
                                    annotation_cache[ann_ref], video_key)
             else:
                 download_folder(remote_path, local_base)
-            extract_archives_in_dir(local_base)
+            extract_archives_in_dir(
+                local_base,
+                extract_to_parent=bool(input_cfg.get("extract_to_parent")),
+            )
             _set_nested(specs, spec_key, local_base)
 
     # Normalize outputs: accept dict or list
@@ -1013,7 +1088,9 @@ def run_passthrough(inputs: dict | None, command: str, outputs: list | None,
 # Public entrypoint builder
 # ---------------------------------------------------------------------------
 
-_DEFAULT_INSTALL_DEPS = "fsspec s3fs toml pandas pyyaml huggingface_hub"
+_DEFAULT_INSTALL_DEPS = (
+    "fsspec>=2024.6.0 's3fs>=2024.6.0' toml pandas pyyaml huggingface_hub"
+)
 
 
 def _resolve_results_root(job_id: str) -> tuple[str, str]:

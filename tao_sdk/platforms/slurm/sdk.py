@@ -163,6 +163,8 @@ class SlurmSDK:
             results_dir=results_dir,
         )
 
+        resource_shape, _ = self._handler.resolve_resource_shape(gpu_count)
+
         self._handler.create_job(
             image=image,
             network="",
@@ -171,7 +173,7 @@ class SlurmSDK:
             specs={},
             job_id=job_id,
             docker_env_vars=container_env,
-            num_gpus=gpu_count,
+            resource_shape=resource_shape,
             num_nodes=num_nodes,
             entrypoint=entrypoint,
             mounts=mounts,
@@ -348,4 +350,3 @@ class SlurmSDK:
                 }
             }
         }
-

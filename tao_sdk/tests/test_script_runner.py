@@ -249,6 +249,15 @@ class TestArchiveExtraction:
         assert (tmp_path / "images" / "a.txt").read_bytes() == b"hello"
         assert (tmp_path / "images.tar.gz.extracted").exists()
 
+    def test_extract_archive_to_parent(self, tmp_path):
+        tar_path = tmp_path / "images.tar.gz"
+        self._make_root_tar(tar_path)
+
+        extract_archive(str(tar_path), str(tmp_path), extract_to_parent=True)
+
+        assert (tmp_path / "a.txt").read_bytes() == b"hello"
+        assert (tmp_path / "images.tar.gz.extracted").exists()
+
     def test_extract_archive_is_idempotent(self, tmp_path):
         tar_path = tmp_path / "videos.tar.gz"
         self._make_tar(tar_path)
@@ -268,6 +277,15 @@ class TestArchiveExtraction:
 
         extract_archives_in_dir(str(sub))
         assert (sub / "videos" / "a.txt").exists()
+
+    def test_extract_archives_in_dir_to_parent(self, tmp_path):
+        sub = tmp_path / "data"
+        sub.mkdir()
+        self._make_root_tar(sub / "images.tar.gz")
+
+        extract_archives_in_dir(str(sub), extract_to_parent=True)
+
+        assert (sub / "a.txt").exists()
 
 
 class TestRewriteSpecPaths:
@@ -553,6 +571,46 @@ class TestMountMode:
         dest = mock_dl.call_args[0][1]
         assert dest.startswith("/results/test-local/inputs/")
         assert "lustre" not in dest
+
+    @patch("os.makedirs")
+    @patch("tao_sdk.script_runner.subprocess")
+    @patch("tao_sdk.script_runner.download_folder")
+    @patch("tao_sdk.script_runner.fsspec.core.url_to_fs")
+    @patch("builtins.open", mock_open(read_data="{}"))
+    def test_input_container_path_overrides_job_input_dir(
+        self, mock_url_to_fs, mock_dl_folder, mock_sub, mock_makedirs,
+    ):
+        """Stable container paths support converters that persist paths."""
+        mock_sub.run.return_value = MagicMock(returncode=0)
+        fs = MagicMock()
+        fs.isdir.return_value = True
+        mock_url_to_fs.return_value = (fs, "")
+
+        specs = {
+            "aicity": {
+                "root": "s3://bucket/sparse4d",
+            },
+        }
+        inputs = {
+            "aicity.root": {
+                "type": "folder",
+                "container_path": "/data/aicity_root",
+            },
+        }
+
+        run(
+            specs=specs, job_id="test-container-path",
+            command="echo {config_path}",
+            inputs=inputs, outputs={},
+            config_format="json",
+            mount_path=None,
+        )
+
+        mock_dl_folder.assert_called_once_with(
+            "s3://bucket/sparse4d",
+            "/data/aicity_root",
+        )
+        assert specs["aicity"]["root"] == "/data/aicity_root"
 
 
 class TestArchiveInRun:
