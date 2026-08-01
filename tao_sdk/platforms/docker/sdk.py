@@ -234,6 +234,7 @@ class DockerSDK:
         shm_size: int | str | None = None,
         run_as_user: bool | None = None,
         container_user: str | int | None = None,
+        gpu_ids: list | str | None = None,
     ) -> Job:
         """Submit a job to the local Docker daemon.
 
@@ -247,6 +248,14 @@ class DockerSDK:
             command: Full shell command. Runs as-is inside the container —
                 no SDK wrapping. Use ``build_entrypoint`` for S3 I/O.
             gpu_count: Number of GPUs (passed via ``--gpus``). Use ``-1`` for all.
+                A count-based request resolves to the *first* ``gpu_count``
+                devices, so ``gpu_count=1`` always means physical GPU 0. Pass
+                ``gpu_ids`` to choose which devices instead.
+            gpu_ids: Explicit GPU selection — ``[1]``, ``[0, 2]``, ``"1"``,
+                ``"0,2"``, or a GPU UUID. Overrides the count-based request so
+                the container is pinned to those devices. Required on a shared
+                host where GPU 0 is busy: without it every job lands on GPU 0
+                regardless of what is free.
             env_vars: Additional container env vars (S3/NGC/HF credentials
                 auto-injected from os.environ).
             hooks: Callbacks: on_complete, on_error, on_epoch_milestone.
@@ -346,6 +355,7 @@ class DockerSDK:
                 shm_size=shm_size,
                 run_as_user=run_as_user,
                 container_user=container_user,
+                gpu_ids=gpu_ids,
             )
             launch_confirmed = True
         except Exception as exc:

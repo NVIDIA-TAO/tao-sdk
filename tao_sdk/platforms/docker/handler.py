@@ -40,6 +40,31 @@ DEFAULT_DOCKER_NETWORK = "tao_default"
 DEFAULT_DOCKER_USERNAME = "$oauthtoken"
 
 
+def _normalize_gpu_ids(gpu_ids: list | str | None) -> list[str]:
+    """Normalize a GPU selection into a list of Docker device-id strings.
+
+    Accepts ``[0, 1]``, ``["0", "1"]``, ``"0,1"``, ``"1"``, or a GPU UUID, and
+    returns ``[]`` when nothing was requested. Docker's ``DeviceRequest``
+    expects string device ids; integers are the natural thing for a caller to
+    pass, so coerce rather than reject.
+    """
+    if gpu_ids is None:
+        return []
+    if isinstance(gpu_ids, str):
+        candidates = gpu_ids.split(",")
+    elif isinstance(gpu_ids, (list, tuple, set)):
+        candidates = list(gpu_ids)
+    else:
+        candidates = [gpu_ids]
+
+    normalized = []
+    for candidate in candidates:
+        text = str(candidate).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
 class DockerContainerIdentityError(RuntimeError):
     """A live container does not match the durable TAO job identity."""
 
@@ -215,6 +240,7 @@ class DockerHandler(BaseHandler):
         shm_size: int | str | None = None,
         run_as_user: bool | None = None,
         container_user: str | int | None = None,
+        gpu_ids: list | str | None = None,
         **kwargs,
     ) -> dict:
         """Create a local Docker container for an SDK job.
@@ -301,7 +327,7 @@ class DockerHandler(BaseHandler):
             run_kwargs["shm_size"] = shm_size
         else:
             run_kwargs["tmpfs"] = {"/dev/shm": ""}
-        self._add_gpu_run_kwargs(run_kwargs, env, num_gpus)
+        self._add_gpu_run_kwargs(run_kwargs, env, num_gpus, gpu_ids)
 
         logger.info("Starting Docker container %s with image %s", container_name, image)
         # Persist the deterministic container identity before sending the
@@ -1470,14 +1496,32 @@ class DockerHandler(BaseHandler):
             volumes[str(source)] = {"bind": str(target), "mode": str(mode or "rw")}
         return volumes or None
 
-    def _add_gpu_run_kwargs(self, run_kwargs: dict, env: dict, num_gpus: int):
+    def _add_gpu_run_kwargs(
+        self,
+        run_kwargs: dict,
+        env: dict,
+        num_gpus: int,
+        gpu_ids: list | str | None = None,
+    ):
+        """Attach the GPU request to ``run_kwargs``.
+
+        ``gpu_ids`` selects *which* physical GPUs the container gets. Without
+        it Docker resolves a count-based request to the first N devices, so
+        ``gpu_count=1`` can only ever land on GPU 0 — on a shared host whose
+        GPU 0 is busy every job OOMs while other GPUs sit idle, with no way to
+        steer it (``NVIDIA_VISIBLE_DEVICES`` is overwritten below).
+        """
         if num_gpus == 0:
             env.setdefault("NVIDIA_VISIBLE_DEVICES", "void")
             return
 
+        device_ids = _normalize_gpu_ids(gpu_ids)
+
         if self._should_use_nvidia_runtime():
             env["NVIDIA_DRIVER_CAPABILITIES"] = "all"
-            env["NVIDIA_VISIBLE_DEVICES"] = "all"
+            # Honour an explicit selection; only fall back to "all" when the
+            # caller did not name devices.
+            env["NVIDIA_VISIBLE_DEVICES"] = ",".join(device_ids) if device_ids else "all"
             run_kwargs["runtime"] = "nvidia"
             return
 
@@ -1486,7 +1530,13 @@ class DockerHandler(BaseHandler):
             logger.warning("Docker module has no DeviceRequest; launching without GPU request")
             return
 
-        if num_gpus < 0:
+        if device_ids:
+            # device_ids and count are mutually exclusive in the Docker API.
+            run_kwargs["device_requests"] = [
+                device_request_cls(device_ids=list(device_ids), capabilities=[["gpu"]])
+            ]
+            logger.info("Pinning container to GPU(s) %s", ",".join(device_ids))
+        elif num_gpus < 0:
             run_kwargs["device_requests"] = [
                 device_request_cls(count=-1, capabilities=[["gpu"]])
             ]
