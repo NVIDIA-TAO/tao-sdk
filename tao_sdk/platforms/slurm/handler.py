@@ -680,6 +680,7 @@ class SlurmHandler(BaseHandler):
             use_timeout=self.use_timeout,
             timeout_hours=self.timeout_hours,
             use_requeue=self.use_requeue,
+            max_job_retries=self.max_job_retries,
             use_srun=self.use_srun_logs,
             command=sdk_command,
             docker_env_vars=docker_env_vars,
@@ -1251,6 +1252,7 @@ class SlurmHandler(BaseHandler):
         use_timeout: bool,
         timeout_hours: float,
         use_requeue: bool,
+        max_job_retries: int,
         use_srun: bool,
         command: str,
         docker_env_vars: dict[str, Any],
@@ -1453,10 +1455,31 @@ class SlurmHandler(BaseHandler):
         if use_timeout and use_requeue:
             script_lines.extend([
                 "",
-                "# Launch self again when timeout exits with code 124",
-                "if [[ $? == 124 ]]; then",
-                "    scontrol requeue $SLURM_JOB_ID",
+                (
+                    "# Requeue this allocation after an inner timeout, bounded "
+                    "by SLURM_MAX_JOB_RETRIES"
+                ),
+                "job_status=$?",
+                "if [[ $job_status == 124 ]]; then",
+                '    restart_count="${SLURM_RESTART_COUNT:-0}"',
+                '    if [[ ! "$restart_count" =~ ^[0-9]+$ ]]; then',
+                (
+                    '        echo "Invalid SLURM_RESTART_COUNT: '
+                    '${restart_count}" >&2'
+                ),
+                "        exit 124",
+                f"    elif (( 10#$restart_count < {max_job_retries} )); then",
+                '        scontrol requeue "$SLURM_JOB_ID"',
+                "        exit $?",
+                "    else",
+                (
+                    '        echo "Maximum timeout self-requeue count '
+                    f'({max_job_retries}) exhausted" >&2'
+                ),
+                "        exit 124",
+                "    fi",
                 "fi",
+                'exit "$job_status"',
             ])
 
         return "\n".join(script_lines) + "\n"
