@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+from unittest.mock import MagicMock
+
+import pytest
 
 
 def _make_handler(monkeypatch, tmp_path, retry_cap):
@@ -127,3 +130,48 @@ def test_zero_cap_disables_timeout_self_requeue(monkeypatch, tmp_path):
     assert result.returncode == 124
     assert calls == []
     assert "Maximum timeout self-requeue count (0) exhausted" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("scheduler_state", "expected"),
+    [
+        ("CANCELLED by 41852", "CANCELLED"),
+        ("COMPLETED+", "COMPLETED"),
+        ("RUNNING", "RUNNING"),
+    ],
+)
+def test_scheduler_state_annotations_are_normalized(
+    monkeypatch,
+    tmp_path,
+    scheduler_state,
+    expected,
+):
+    handler = _make_handler(monkeypatch, tmp_path, "3")
+    monkeypatch.setattr(
+        handler,
+        "_ssh",
+        MagicMock(
+            return_value=subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=scheduler_state + "\n",
+                stderr="",
+            )
+        ),
+    )
+    assert handler.get_slurm_job_status("123") == expected
+
+
+def test_sacct_cancelled_by_user_is_canonicalized(monkeypatch, tmp_path):
+    handler = _make_handler(monkeypatch, tmp_path, "3")
+    responses = iter([
+        subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="CANCELLED by 41852|\n",
+            stderr="",
+        ),
+    ])
+    monkeypatch.setattr(handler, "_ssh", MagicMock(side_effect=responses))
+    assert handler.get_slurm_job_status("123") == "CANCELLED"

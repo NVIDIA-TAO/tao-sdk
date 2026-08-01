@@ -1484,6 +1484,12 @@ class SlurmHandler(BaseHandler):
 
         return "\n".join(script_lines) + "\n"
 
+    @staticmethod
+    def _canonical_slurm_state(raw_state: str) -> str:
+        """Remove scheduler annotations such as ``CANCELLED by <uid>``."""
+        value = raw_state.strip().split("|", 1)[0].split("+", 1)[0].split()
+        return value[0].upper() if value else ""
+
     def get_slurm_job_status(self, slurm_job_id: str | int | None) -> str:
         """Get raw SLURM status using squeue first, then sacct."""
         if not slurm_job_id:
@@ -1496,7 +1502,9 @@ class SlurmHandler(BaseHandler):
             timeout=TIMEOUT_SECONDS,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().splitlines()[0].strip().upper()
+            return self._canonical_slurm_state(
+                result.stdout.strip().splitlines()[0]
+            )
 
         result = self._ssh(
             f"sacct --job={quoted_id} --format=State --noheader --parsable2",
@@ -1506,7 +1514,7 @@ class SlurmHandler(BaseHandler):
         if result.returncode == 0 and result.stdout.strip():
             states = []
             for line in result.stdout.splitlines():
-                state = line.strip().split("|", 1)[0].split("+", 1)[0].upper()
+                state = self._canonical_slurm_state(line)
                 if state:
                     states.append(state)
             for terminal in (
