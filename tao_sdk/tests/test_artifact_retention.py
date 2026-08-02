@@ -1163,6 +1163,46 @@ def test_slurm_backend_identity_uses_cluster_name_and_ignores_host_order():
     assert first.get_backend_identity() != third.get_backend_identity()
 
 
+def test_slurm_backend_identity_falls_back_to_accounting_cluster_record():
+    from tao_sdk.platforms.slurm.handler import SlurmHandler
+
+    handler = SlurmHandler.__new__(SlurmHandler)
+    handler.login_user = "scientist"
+    handler._ssh = MagicMock(side_effect=[
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+        SimpleNamespace(returncode=0, stdout="tao-cluster\n", stderr=""),
+    ])
+
+    identity = handler.get_backend_identity()
+
+    assert identity.startswith("slurm-sha256:")
+    assert handler._ssh.call_args_list == [
+        call("scontrol show config", check=False, timeout=30),
+        call(
+            "sacctmgr -nP show cluster format=Cluster",
+            check=False,
+            timeout=30,
+        ),
+    ]
+
+
+def test_slurm_backend_identity_rejects_ambiguous_accounting_clusters():
+    from tao_sdk.platforms.slurm.handler import SlurmHandler
+
+    handler = SlurmHandler.__new__(SlurmHandler)
+    handler.login_user = "scientist"
+    handler._ssh = MagicMock(side_effect=[
+        SimpleNamespace(returncode=1, stdout="", stderr="unavailable"),
+        SimpleNamespace(
+            returncode=0,
+            stdout="tao-cluster-a\ntao-cluster-b\n",
+            stderr="",
+        ),
+    ])
+
+    assert handler.get_backend_identity() == ""
+
+
 def _slurm_sdk_with_create_error(error):
     from tao_sdk.platforms.slurm.sdk import SlurmSDK
 

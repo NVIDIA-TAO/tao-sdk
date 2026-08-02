@@ -463,21 +463,56 @@ class SlurmHandler(BaseHandler):
         current_index = getattr(self, "current_hostname_index", 0)
         if cached and cached_index == current_index:
             return cached
+        cluster_name = ""
+        failures: list[str] = []
         try:
             result = self._ssh("scontrol show config", check=False, timeout=30)
+            match = re.search(
+                r"(?m)^\s*ClusterName\s*=\s*(\S+)\s*$",
+                result.stdout or "",
+            )
+            if result.returncode == 0 and match:
+                cluster_name = match.group(1)
+            else:
+                failures.append("scontrol did not report ClusterName")
         except Exception as exc:
-            logger.warning("Could not verify SLURM cluster identity: %s", exc)
-            return ""
-        match = re.search(
-            r"(?m)^\s*ClusterName\s*=\s*(\S+)\s*$",
-            result.stdout or "",
-        )
-        if result.returncode != 0 or not match:
-            logger.warning("SLURM did not report a stable ClusterName")
+            failures.append(f"scontrol failed: {exc}")
+
+        if not cluster_name:
+            # Some SLURM control planes intermittently omit ClusterName from
+            # ``scontrol show config`` while scheduler operations remain
+            # healthy.  sacctmgr reads the cluster record from SLURM's
+            # accounting database and provides an independent authoritative
+            # source without weakening the backend-identity fence.
+            try:
+                result = self._ssh(
+                    "sacctmgr -nP show cluster format=Cluster",
+                    check=False,
+                    timeout=30,
+                )
+                cluster_names = {
+                    line.strip().split("|", 1)[0]
+                    for line in (result.stdout or "").splitlines()
+                    if line.strip().split("|", 1)[0]
+                }
+                if result.returncode == 0 and len(cluster_names) == 1:
+                    cluster_name = cluster_names.pop()
+                else:
+                    failures.append(
+                        "sacctmgr did not report exactly one cluster"
+                    )
+            except Exception as exc:
+                failures.append(f"sacctmgr failed: {exc}")
+
+        if not cluster_name:
+            logger.warning(
+                "SLURM did not report a stable ClusterName (%s)",
+                "; ".join(failures),
+            )
             return ""
         target = json.dumps(
             {
-                "cluster_name": match.group(1),
+                "cluster_name": cluster_name,
                 "user": self.login_user,
             },
             sort_keys=True,
