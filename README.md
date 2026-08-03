@@ -176,3 +176,5 @@ tao-sdk/
 ## Related repos
 
 - [**tao-skills-external**](https://github.com/NVIDIA-TAO/tao-skill-bank) — the skill bank (primary artifact; plugin marketplace)
+
+<!-- blossom CI smoke test: verify 7.1.0 OSS migration tests pass — DO NOT MERGE -->
