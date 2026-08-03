@@ -7,9 +7,9 @@ import json
 import logging
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from tao_sdk.models import Job
 
@@ -44,6 +44,35 @@ class JobMonitor:
 
     def watch(self, job: Job, hooks: dict, handler: Any) -> None:
         """Register a job for monitoring."""
+        if self._store:
+            # Keep JobMonitor usable as a standalone public component while
+            # ensuring its first status transition has a durable row on which
+            # monotonic terminal-state protection can operate. The insert is
+            # atomic so a concurrent terminal write can never be replaced.
+            self._store.create_job_if_absent(
+                job_id=job.id,
+                network_arch=job.network_arch,
+                action=job.action,
+                workspace_id=job.workspace_id,
+                backend_type=job.backend_type,
+                backend_job_id=job.backend_job_id,
+                status=job.status,
+                parent_job_id=job.parent_job_id or None,
+                results_dir=job.results_dir,
+                local_results_dir=job.local_results_dir,
+                base_checkpoint=job.base_checkpoint,
+            )
+            durable = self._store.get_job(job.id)
+            if durable:
+                durable_status = durable.get("status", job.status)
+                job.status = durable_status
+                if durable_status in TERMINAL_STATUSES:
+                    # Another process already finalized this job. Registering
+                    # a stale Job object must never revive backend polling.
+                    with self._lock:
+                        self._watched.pop(job.id, None)
+                    self._write_state_file()
+                    return
         with self._lock:
             self._watched[job.id] = _WatchEntry(
                 job=job,
@@ -88,12 +117,38 @@ class JobMonitor:
 
     def _check_one(self, job_id: str, entry: _WatchEntry) -> None:
         """Poll one job and fire hooks on state transitions."""
+        if self._store:
+            durable = self._store.get_job(job_id)
+            if not durable:
+                logger.warning(
+                    "Job %s disappeared from the durable store before polling",
+                    job_id,
+                )
+                return
+            durable_status = durable.get("status", entry.last_status)
+            if durable_status in TERMINAL_STATUSES:
+                entry.last_status = durable_status
+                entry.job.status = durable_status
+                self.unwatch(job_id)
+                self._write_state_file()
+                return
         try:
             raw_status = entry.handler.get_tao_job_status(job_id)
             status = entry.handler.normalize_status(raw_status)
         except Exception:
             logger.exception("Failed to get status for job %s", job_id)
             return
+
+        if self._store:
+            if not self._store.update_job_status(job_id, status):
+                durable = self._store.get_job(job_id)
+                if not durable:
+                    logger.warning(
+                        "Job %s disappeared from the durable store while polling",
+                        job_id,
+                    )
+                    return
+                status = durable.get("status", status)
 
         if status == entry.last_status:
             # No transition — but if Running, check for epoch milestones
@@ -107,8 +162,6 @@ class JobMonitor:
         entry.job.status = status
         logger.info("Job %s: %s -> %s", job_id, old_status, status)
 
-        if self._store:
-            self._store.update_job_status(job_id, status)
         self._write_state_file()
 
         if status == "Complete":

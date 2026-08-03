@@ -23,6 +23,8 @@ from tao_sdk.script_runner import (
     extract_archives_in_dir,
     upload_results,
     run,
+    run_args,
+    run_passthrough,
 )
 
 
@@ -745,6 +747,28 @@ class TestOutputDestinationBranches:
     @patch("tao_sdk.script_runner.subprocess.run")
     @patch("tao_sdk.script_runner.upload_results")
     @patch("tao_sdk.script_runner.open", create=True, new_callable=mock_open)
+    def test_absolute_local_file_output_creates_parent_only(
+        self, _mock_open, mock_upload, mock_subprocess, mock_mkdir,
+    ):
+        mock_subprocess.return_value = MagicMock(returncode=0)
+        model_path = "/lustre/fsw/tao/results/job-1/pruned_model.pth"
+        specs = {"prune": {"pruned_file": model_path}}
+        run(
+            specs=specs, job_id="job-1",
+            command="echo {config_path}",
+            inputs={}, outputs={"prune.pruned_file": {"type": "file"}},
+            config_format="json",
+        )
+        assert specs["prune"]["pruned_file"] == model_path
+        mock_upload.assert_not_called()
+        mkdir_calls = [c.args[0] for c in mock_mkdir.call_args_list]
+        assert os.path.dirname(model_path) in mkdir_calls
+        assert model_path not in mkdir_calls
+
+    @patch("tao_sdk.script_runner.os.makedirs")
+    @patch("tao_sdk.script_runner.subprocess.run")
+    @patch("tao_sdk.script_runner.upload_results")
+    @patch("tao_sdk.script_runner.open", create=True, new_callable=mock_open)
     def test_relative_default_autofills_to_s3_when_bucket_set(
         self, _mock_open, mock_upload, mock_subprocess, _mock_mkdir, monkeypatch,
     ):
@@ -786,6 +810,7 @@ class TestOutputDestinationBranches:
         )
         assert specs["train"]["output_dir"] == "/lustre/fsw/tao/results/job-1/train_output_dir"
         mock_upload.assert_not_called()
+        assert "/lustre/fsw/tao/results/job-1/spec.json" in mock_subprocess.call_args[0][0]
 
     @patch("tao_sdk.script_runner.os.makedirs")
     @patch("tao_sdk.script_runner.subprocess.run")
@@ -816,6 +841,77 @@ class TestOutputDestinationBranches:
         assert any("NOT survive" in r.message for r in caplog.records)
 
 
+class TestResultsRootWorkingDirectory:
+
+    @patch("tao_sdk.script_runner.os.makedirs")
+    @patch("tao_sdk.script_runner.subprocess.run")
+    @patch("tao_sdk.script_runner.open", create=True, new_callable=mock_open)
+    def test_config_mode_uses_results_root_for_work_dir(
+        self, _mock_open, mock_subprocess, mock_mkdir, monkeypatch,
+    ):
+        monkeypatch.setenv("TAO_RESULTS_ROOT", "/mounted/results")
+        monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
+        mock_subprocess.return_value = MagicMock(returncode=0)
+
+        specs = {"train": {"output_dir": "output"}}
+        run(
+            specs=specs,
+            job_id="job-1",
+            command="echo {config_path}",
+            inputs={},
+            outputs={"train.output_dir": {"type": "folder"}},
+            config_format="json",
+        )
+
+        mkdir_calls = [c.args[0] for c in mock_mkdir.call_args_list]
+        assert "/mounted/results/job-1" in mkdir_calls
+        assert "/mounted/results/job-1/train_output_dir" in mkdir_calls
+        assert specs["train"]["output_dir"] == "/mounted/results/job-1/train_output_dir"
+        assert "/mounted/results/job-1/spec.json" in mock_subprocess.call_args[0][0]
+
+    @patch("tao_sdk.script_runner.os.makedirs")
+    @patch("tao_sdk.script_runner.subprocess.run")
+    def test_args_mode_uses_results_root_for_work_dir(
+        self, mock_subprocess, mock_mkdir, monkeypatch,
+    ):
+        monkeypatch.setenv("TAO_RESULTS_ROOT", "/mounted/results")
+        monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
+        mock_subprocess.return_value = MagicMock(returncode=0)
+
+        args = {"output-dir": "output"}
+        run_args(
+            args_dict=args,
+            job_id="job-1",
+            command="echo",
+            inputs={},
+            outputs={"output-dir": {"type": "folder"}},
+        )
+
+        mkdir_calls = [c.args[0] for c in mock_mkdir.call_args_list]
+        assert "/mounted/results/job-1" in mkdir_calls
+        assert "/mounted/results/job-1/output_dir" in mkdir_calls
+        assert args["output-dir"] == "/mounted/results/job-1/output_dir"
+        assert "--output-dir '/mounted/results/job-1/output_dir'" in mock_subprocess.call_args[0][0]
+
+    @patch("tao_sdk.script_runner.os.makedirs")
+    @patch("tao_sdk.script_runner.subprocess.call", return_value=0)
+    def test_passthrough_mode_uses_results_root_for_work_dir(
+        self, _mock_call, mock_mkdir, monkeypatch,
+    ):
+        monkeypatch.setenv("TAO_RESULTS_ROOT", "/mounted/results")
+        monkeypatch.delenv("S3_BUCKET_NAME", raising=False)
+
+        run_passthrough(
+            inputs={},
+            command="true",
+            outputs=[],
+            job_id="job-1",
+        )
+
+        mkdir_calls = [c.args[0] for c in mock_mkdir.call_args_list]
+        assert "/mounted/results/job-1" in mkdir_calls
+
+
 class TestS3ToLustreMapping:
 
     def test_basic_mapping(self):
@@ -833,3 +929,125 @@ class TestS3ToLustreMapping:
     def test_trailing_slash(self):
         result = _s3_to_lustre("s3://bucket/folder/", "/mnt/lustre")
         assert result == "/mnt/lustre/bucket/folder/"
+
+
+def test_ptm_spec_walk_stages_ngc_uris_in_nested_and_list_values(tmp_path, monkeypatch):
+    """ngc:// URIs must be staged by the dedicated downloader wherever they
+    appear in the spec — the generic fsspec input path raises 'protocol not
+    known' on them (root cause of the 2026-07-30 DINO rec-1 startup crash)."""
+    from tao_sdk import script_runner
+
+    def fake_download_remote(value, local_dir):
+        os.makedirs(local_dir, exist_ok=True)
+        with open(os.path.join(local_dir, "model.pth"), "w") as f:
+            f.write("x")
+
+    monkeypatch.setattr(script_runner, "download_remote", fake_download_remote)
+
+    specs = {
+        "model": {
+            "pretrained_backbone_path": "ngc://nvidia/tao/pretrained_dino_nvimagenet:resnet50",
+            "teachers": ["ngc://nvidia/tao/teacher:v1", "/lustre/local.pth"],
+        },
+    }
+    script_runner._download_ptm_from_specs(specs, str(tmp_path))
+
+    assert specs["model"]["pretrained_backbone_path"].endswith("model.pth")
+    assert not specs["model"]["pretrained_backbone_path"].startswith("ngc://")
+    assert specs["model"]["teachers"][0].endswith("model.pth")
+    assert specs["model"]["teachers"][1] == "/lustre/local.pth"
+
+
+# ---------------------------------------------------------------------------
+# Auto-resume after requeue: wall-time (timeout 124 → scontrol requeue) and
+# node-failure requeue re-run the frozen entrypoint; the runtime must point
+# empty resume keys at the previous attempt's latest checkpoint.
+# ---------------------------------------------------------------------------
+
+def _resume_specs(results_dir):
+    return {
+        "results_dir": str(results_dir),
+        "train": {
+            "num_epochs": 50,
+            "resume_training_checkpoint_path": "",
+        },
+    }
+
+
+def _write_checkpoint(path, mtime=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("weights")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+
+
+def test_auto_resume_patches_spec_with_latest_checkpoint(tmp_path):
+    from tao_sdk.script_runner import _apply_auto_resume
+
+    out_dir = tmp_path / "results"
+    _write_checkpoint(str(out_dir / "train" / "model_epoch_003.pth"), mtime=1000)
+    _write_checkpoint(str(out_dir / "train" / "model_epoch_007.pth"), mtime=2000)
+
+    specs = _resume_specs(out_dir)
+    chosen = _apply_auto_resume(specs, {"results_dir": {"type": "folder"}})
+
+    assert chosen == str(out_dir / "train" / "model_epoch_007.pth")
+    assert specs["train"]["resume_training_checkpoint_path"] == chosen
+
+
+def test_auto_resume_noop_without_checkpoint(tmp_path):
+    from tao_sdk.script_runner import _apply_auto_resume
+
+    out_dir = tmp_path / "results"
+    os.makedirs(out_dir / "train", exist_ok=True)
+
+    specs = _resume_specs(out_dir)
+    chosen = _apply_auto_resume(specs, {"results_dir": {"type": "folder"}})
+
+    assert chosen is None
+    assert specs["train"]["resume_training_checkpoint_path"] == ""
+
+
+def test_auto_resume_never_touches_an_explicit_resume_path(tmp_path):
+    from tao_sdk.script_runner import _apply_auto_resume
+
+    out_dir = tmp_path / "results"
+    _write_checkpoint(str(out_dir / "train" / "model_epoch_003.pth"))
+
+    specs = _resume_specs(out_dir)
+    specs["train"]["resume_training_checkpoint_path"] = "/lustre/user/picked.pth"
+    chosen = _apply_auto_resume(specs, {"results_dir": {"type": "folder"}})
+
+    assert chosen is None
+    assert specs["train"]["resume_training_checkpoint_path"] == "/lustre/user/picked.pth"
+
+
+def test_auto_resume_ignores_staged_ptm_and_inputs(tmp_path):
+    """A freshly staged pretrained model or downloaded input .pth is not
+    training state; 'resuming' from it would silently restart training."""
+    from tao_sdk.script_runner import _apply_auto_resume
+
+    out_dir = tmp_path / "results"
+    _write_checkpoint(str(out_dir / "ptm" / "backbone.pth"))
+    _write_checkpoint(str(out_dir / "inputs" / "pretrained.pth"))
+
+    specs = _resume_specs(out_dir)
+    chosen = _apply_auto_resume(specs, {"results_dir": {"type": "folder"}})
+
+    assert chosen is None
+    assert specs["train"]["resume_training_checkpoint_path"] == ""
+
+
+def test_auto_resume_can_be_disabled(tmp_path, monkeypatch):
+    from tao_sdk.script_runner import _apply_auto_resume
+
+    out_dir = tmp_path / "results"
+    _write_checkpoint(str(out_dir / "train" / "model_epoch_003.pth"))
+
+    monkeypatch.setenv("TAO_AUTO_RESUME", "0")
+    specs = _resume_specs(out_dir)
+    chosen = _apply_auto_resume(specs, {"results_dir": {"type": "folder"}})
+
+    assert chosen is None
+    assert specs["train"]["resume_training_checkpoint_path"] == ""

@@ -67,6 +67,7 @@ def checkpoint_epoch(path: str | os.PathLike[str]) -> int | None:
         (
             r"(?:^|[/_.-])checkpoint[_-]?epoch[_-]?0*(\d+)(?:\D|$)",
             r"(?:^|[/_.-])model[_-]?epoch[_-]?0*(\d+)(?:\D|$)",
+            r"(?:^|[/_.-])model[_-]?best[_-]?0*(\d+)(?:\D|$)",
             r"(?:^|[/_.-])epoch[_-]?0*(\d+)(?:\D|$)",
             r"(?:^|[/_.-])ep[_-]?0*(\d+)(?:\D|$)",
         ),

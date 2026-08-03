@@ -1,11 +1,12 @@
 # TAO Execution SDK
 
-Optional Python layer on top of the [TAO skill bank](https://github.com/NVIDIA-TAO/tao-skills-bank). The skill bank works with just docker; install this SDK **only** if you need one of:
+Optional Python layer on top of the [TAO skill bank](https://github.com/NVIDIA-TAO/tao-skill-bank). The skill bank works with just docker; install this SDK **only** if you need one of:
 
 - Job handles with persistent state (SQLite)
 - Background polling + status normalization
 - S3 I/O auto-wrapping (`script_runner` inputs/outputs)
 - Multi-node distributed training
+- Direct Python-script jobs in an existing virtual environment
 - DGX Cloud Lepton access (Lepton is API-first — SDK is the only path)
 - Failure analysis (OOM classification, node events) on Lepton
 
@@ -21,6 +22,7 @@ If you're running locally on your own GPU, or on Brev via `brev exec docker run`
 | `tao_sdk.monitor.JobMonitor` | Background daemon thread for status polling |
 | `tao_sdk.io_wrapper`, `tao_sdk.script_runner` | Build shell harness for S3 input download + output upload |
 | `tao_sdk.models` | Data classes: `Job`, `JobStatus`, `Checkpoint`, `CredentialError` |
+| `tao_sdk.platforms.virtualenv.VirtualEnvSDK` | Runs isolated local Python jobs without a container or shell |
 | `tao_sdk.handlers/` | Platform handler interface + Lepton implementation |
 
 No skill-bank content lives in this repo. The skill bank is a separate artifact — this SDK only consumes its metadata at runtime.
@@ -94,6 +96,36 @@ if s.status == 'Error':
 
 For full API surface and patterns, see the skill bank's `platform/tao-sdk/SKILL.md`.
 
+### Local virtual-environment jobs
+
+Use the separate Python-script capability when an action is installed in a
+local virtual environment instead of packaged as a container CLI:
+
+```python
+from tao_sdk.platforms.virtualenv import VirtualEnvSDK
+
+sdk = VirtualEnvSDK(
+    venv_path=".venv",
+    work_dir=".tao/virtualenv",
+)
+job = sdk.create_python_job(
+    script="train.py",
+    specs={"train": {"epochs": 2}, "results_dir": "output"},
+    config_format="yaml",
+    script_args=["--config", "{config_path}"],
+    outputs={"results_dir": {"type": "folder"}},
+    gpu_count=1,
+)
+```
+
+The SDK uses a job-local, standard-library Python supervisor so completion can
+be recovered after an orchestrator restart. That supervisor invokes the
+training argv as ``[.venv/bin/python, train.py, ...]`` without activating the
+environment or using a shell. Each job receives its own spec, logs, durable
+exit record, and results directory. Only local declared inputs are supported;
+stage remote data before submission. A positive `gpu_count` without `gpu_ids`
+is metadata only and preserves existing CUDA visibility.
+
 ## Typical workflow (agent-driven)
 
 The SDK is designed to be used through an agent that reads the skill bank. The user doesn't write the Python above by hand — the agent constructs it from the skill + dataset intent:
@@ -109,11 +141,11 @@ User: "Fine-tune cosmos-rl on s3://bucket/datasets/my-data, 8 GPUs on Lepton"
 For the skill bank (the thing the agent reads), install the plugin:
 
 ```shell
-/plugin marketplace add git@github.com:NVIDIA-TAO/tao-skills-bank.git
+/plugin marketplace add git@github.com:NVIDIA-TAO/tao-skill-bank.git
 /plugin install tao-skill-bank@tao-skills
 ```
 
-See the [skill bank README](https://github.com/NVIDIA-TAO/tao-skills-bank/blob/main/README.md) for the full install flow.
+See the [skill bank README](https://github.com/NVIDIA-TAO/tao-skill-bank/blob/main/README.md) for the full install flow.
 
 ## Project structure
 
@@ -143,4 +175,4 @@ tao-sdk/
 
 ## Related repos
 
-- [**tao-skills-external**](https://github.com/NVIDIA-TAO/tao-skills-bank) — the skill bank (primary artifact; plugin marketplace)
+- [**tao-skills-external**](https://github.com/NVIDIA-TAO/tao-skill-bank) — the skill bank (primary artifact; plugin marketplace)

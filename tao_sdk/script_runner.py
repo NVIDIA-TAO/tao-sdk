@@ -181,36 +181,122 @@ def _download_ptm_from_specs(specs: dict, results_dir: str, _prefix: str = ""):
 
         if isinstance(value, dict):
             _download_ptm_from_specs(value, results_dir, full_key)
+        elif isinstance(value, list):
+            for i, item in enumerate(value):
+                item_key = f"{full_key}[{i}]"
+                if isinstance(item, dict):
+                    _download_ptm_from_specs(item, results_dir, item_key)
+                elif isinstance(item, str) and (_is_ngc(item) or _is_hf(item)):
+                    value[i] = _stage_ptm_uri(item, results_dir, item_key)
         elif isinstance(value, str) and (_is_ngc(value) or _is_hf(value)):
-            # Download to a deterministic local path
-            safe_key = full_key.replace(".", "_")
-            local_dir = os.path.join(results_dir, "ptm", safe_key)
-            logger.info("Downloading PTM for %s: %s → %s", full_key, value, local_dir)
-            download_remote(value, local_dir)
+            specs[key] = _stage_ptm_uri(value, results_dir, full_key)
 
-            if not os.path.exists(local_dir) or not os.listdir(local_dir):
-                raise RuntimeError(f"PTM download produced no files at {local_dir}")
 
-            # NGC downloads of single-file checkpoints (.tlt, .pth, etc.) need
-            # the file path, not the dir. HF multi-shard downloads need the dir
-            # (config.json + index + shards) so from_pretrained() can read it.
-            # Match TAO Core's search_for_ptm extension list — .safetensors and
-            # .bin are intentionally excluded so HF dirs fall through to the
-            # ``local_path = local_dir`` default below.
-            local_path = local_dir
-            if os.path.isdir(local_dir):
-                model_extensions = ('.pth', '.pth.tar', '.pt', '.ckpt', '.hdf5', '.tlt')
-                for root, dirs, files in os.walk(local_dir):
-                    for f in files:
-                        if any(f.endswith(ext) for ext in model_extensions):
-                            local_path = os.path.join(root, f)
-                            logger.info("Found model file: %s", local_path)
-                            break
-                    if local_path != local_dir:
-                        break
+def _stage_ptm_uri(value: str, results_dir: str, full_key: str) -> str:
+    """Download one ngc:// or hf_* URI and return the local path to use."""
+    # Download to a deterministic local path
+    safe_key = full_key.replace(".", "_").replace("[", "_").replace("]", "")
+    local_dir = os.path.join(results_dir, "ptm", safe_key)
+    logger.info("Downloading PTM for %s: %s → %s", full_key, value, local_dir)
+    download_remote(value, local_dir)
 
-            specs[key] = local_path
-            logger.info("Rewrote spec %s → %s", full_key, local_path)
+    if not os.path.exists(local_dir) or not os.listdir(local_dir):
+        raise RuntimeError(f"PTM download produced no files at {local_dir}")
+
+    # NGC downloads of single-file checkpoints (.tlt, .pth, etc.) need
+    # the file path, not the dir. HF multi-shard downloads need the dir
+    # (config.json + index + shards) so from_pretrained() can read it.
+    # Match TAO Core's search_for_ptm extension list — .safetensors and
+    # .bin are intentionally excluded so HF dirs fall through to the
+    # ``local_path = local_dir`` default below.
+    local_path = local_dir
+    if os.path.isdir(local_dir):
+        model_extensions = ('.pth', '.pth.tar', '.pt', '.ckpt', '.hdf5', '.tlt')
+        for root, dirs, files in os.walk(local_dir):
+            for f in files:
+                if any(f.endswith(ext) for ext in model_extensions):
+                    local_path = os.path.join(root, f)
+                    logger.info("Found model file: %s", local_path)
+                    break
+            if local_path != local_dir:
+                break
+
+    logger.info("Rewrote spec %s → %s", full_key, local_path)
+    return local_path
+
+
+_RESUME_LEAF_KEY = "resume_training_checkpoint_path"
+_CHECKPOINT_EXTENSIONS = (".pth", ".pth.tar", ".pt", ".ckpt")
+
+
+def _iter_resume_leaves(specs: dict, _prefix: str = ""):
+    for key, value in specs.items():
+        full_key = f"{_prefix}.{key}" if _prefix else key
+        if isinstance(value, dict):
+            yield from _iter_resume_leaves(value, full_key)
+        elif key == _RESUME_LEAF_KEY:
+            yield full_key, value
+
+
+def _find_latest_checkpoint(search_roots) -> str | None:
+    best = None
+    for root_dir in search_roots:
+        if not root_dir or not os.path.isdir(root_dir):
+            continue
+        for root, dirs, files in os.walk(root_dir):
+            # A staged pretrained model or downloaded input is not a
+            # training-state checkpoint.
+            dirs[:] = [d for d in dirs if d not in ("ptm", "inputs")]
+            for name in files:
+                if not name.endswith(_CHECKPOINT_EXTENSIONS):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                if stat.st_size == 0:
+                    continue
+                candidate = (stat.st_mtime, path)
+                if best is None or candidate > best:
+                    best = candidate
+    return best[1] if best else None
+
+
+def _apply_auto_resume(specs: dict, outputs) -> str | None:
+    """Point empty resume keys at the latest checkpoint from a prior attempt.
+
+    SLURM wall-time requeue and node-failure requeue re-run the identical
+    entrypoint with the spec frozen at create_job() time, so a resumable job
+    would otherwise restart from epoch 0. Declared output dirs are job-scoped:
+    a checkpoint can exist there only if an earlier attempt of this same job
+    wrote it. Only output dirs are searched — inputs and PTMs stage elsewhere
+    (and are pruned defensively) so a freshly downloaded model file can never
+    masquerade as training state. Set TAO_AUTO_RESUME=0 to disable.
+    """
+    if os.environ.get("TAO_AUTO_RESUME", "1").lower() in ("0", "false", "no"):
+        return None
+    empty_leaves = [key for key, value in _iter_resume_leaves(specs) if not value]
+    if not empty_leaves:
+        return None
+
+    output_keys = list(outputs.keys()) if isinstance(outputs, dict) else list(outputs or [])
+    search_roots = []
+    for key in output_keys:
+        value = _get_nested(specs, key)
+        if isinstance(value, str) and value.startswith("/"):
+            search_roots.append(value)
+
+    checkpoint = _find_latest_checkpoint(search_roots)
+    if not checkpoint:
+        return None
+    for key in empty_leaves:
+        _set_nested(specs, key, checkpoint)
+        logger.info(
+            "Auto-resume: found checkpoint from a previous attempt of this "
+            "job; setting %s → %s", key, checkpoint,
+        )
+    return checkpoint
 
 
 def _s3_to_lustre(remote_path: str, mount_path: str) -> str:
@@ -592,7 +678,8 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
         upload_excludes: Patterns to exclude from upload.
         mount_path: If set, use Lustre/NFS mount instead of downloading.
     """
-    results_dir = f"/results/{job_id}"
+    results_root, results_kind = _resolve_results_root(job_id)
+    results_dir = results_root if results_kind == "mount" else f"/results/{job_id}"
     os.makedirs(results_dir, exist_ok=True)
 
     # Phase 1: Download inputs and rewrite spec paths
@@ -611,7 +698,11 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
         if isinstance(remote_path, list):
             final_paths = []
             for idx, item in enumerate(remote_path):
-                if not item or not _is_remote(item):
+                if (not item or not _is_remote(item)
+                        or _is_ngc(item) or _is_hf(item)):
+                    # NGC/HF URIs are staged scheme-aware by
+                    # _download_ptm_from_specs; the fsspec path below
+                    # raises "protocol not known" on them.
                     final_paths.append(item)
                     continue
                 local_base = _input_local_base(results_dir, spec_key, input_cfg, idx)
@@ -640,6 +731,11 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
             _set_nested(specs, spec_key, final_paths)
             continue
         if not remote_path or not _is_remote(remote_path):
+            continue
+        if _is_ngc(remote_path) or _is_hf(remote_path):
+            # NGC/HF URIs have dedicated downloaders; the generic fsspec
+            # path below raises "protocol not known" on them. They are
+            # staged (and the spec key rewritten) by _download_ptm_from_specs.
             continue
 
         # Auto-detect file vs folder from the actual remote path
@@ -748,7 +844,6 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
     # the agent's concern). Auto-fill any model-natural relative defaults
     # like cosmos-rl's ``output_dir: "output"``. Agent URIs / absolute paths
     # are preserved.
-    results_root, results_kind = _resolve_results_root(job_id)
     _autofill_output_destinations(specs, None, output_keys, results_root)
 
     # Three branches:
@@ -758,17 +853,24 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
     output_remote_map = {}
     for spec_key, output_cfg in output_keys.items():
         remote_path = _get_nested(specs, spec_key)
+        output_type = output_cfg.get("type", "folder") if isinstance(output_cfg, dict) else "folder"
         if remote_path and _is_remote(remote_path):
             if mount_path:
                 local_path = _s3_to_lustre(remote_path, mount_path)
             else:
                 local_path = os.path.join(results_dir, spec_key.replace(".", "_"))
-            os.makedirs(local_path, exist_ok=True)
+            if output_type == "folder":
+                os.makedirs(local_path, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
             output_remote_map[local_path] = remote_path
             _set_nested(specs, spec_key, local_path)
         elif isinstance(remote_path, str) and remote_path.startswith("/"):
             local_path = remote_path
-            os.makedirs(local_path, exist_ok=True)
+            if output_type == "folder":
+                os.makedirs(local_path, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
             _set_nested(specs, spec_key, local_path)
         else:
             raise RuntimeError(
@@ -783,6 +885,11 @@ def run(specs: dict, job_id: str, command: str, inputs: dict,
     # to local paths inside the container. This mirrors TAO Core's
     # download_files_from_spec() behavior.
     _download_ptm_from_specs(specs, results_dir)
+
+    # Phase 1.6: Resume from a previous attempt of this job when one left a
+    # checkpoint in a declared output dir (wall-time requeue, node-failure
+    # requeue). Runs after output routing so output keys hold real paths.
+    _apply_auto_resume(specs, outputs)
 
     # Phase 2: Write config file
     config_path = os.path.join(results_dir, f"spec.{config_format}")
@@ -844,7 +951,8 @@ def run_args(args_dict: dict, job_id: str, command: str, inputs: dict,
         upload_excludes: Patterns to exclude from upload.
         mount_path: If set, use Lustre/NFS mount for S3 paths.
     """
-    results_dir = f"/results/{job_id}"
+    results_root, results_kind = _resolve_results_root(job_id)
+    results_dir = results_root if results_kind == "mount" else f"/results/{job_id}"
     os.makedirs(results_dir, exist_ok=True)
 
     # Phase 1: Download inputs and rewrite arg values to local paths
@@ -861,6 +969,14 @@ def run_args(args_dict: dict, job_id: str, command: str, inputs: dict,
     for arg_name, input_cfg in input_keys.items():
         remote_path = args_dict.get(arg_name)
         if not remote_path or not _is_remote(remote_path):
+            continue
+        if _is_ngc(remote_path) or _is_hf(remote_path):
+            # NGC/HF URIs have dedicated downloaders; the generic fsspec
+            # path below raises "protocol not known" on them. Args mode has
+            # no spec walk, so stage here and rewrite the arg in place.
+            args_dict[arg_name] = _stage_ptm_uri(
+                remote_path, results_dir, arg_name
+            )
             continue
 
         # Auto-detect file vs folder from the actual remote path
@@ -945,7 +1061,6 @@ def run_args(args_dict: dict, job_id: str, command: str, inputs: dict,
         output_keys_args = {}
 
     # Auto-fill relative defaults using the runtime-resolved destination.
-    results_root, results_kind = _resolve_results_root(job_id)
     _autofill_output_destinations(None, args_dict, output_keys_args, results_root)
 
     # Three branches mirror run(): remote URI → upload; absolute → direct; else defensive.
@@ -1028,7 +1143,8 @@ def run_passthrough(inputs: dict | None, command: str, outputs: list | None,
     outputs = outputs or []
     upload_excludes = upload_excludes or []
 
-    results_dir = f"/results/{job_id}"
+    results_root, results_kind = _resolve_results_root(job_id)
+    results_dir = results_root if results_kind == "mount" else f"/results/{job_id}"
     os.makedirs(results_dir, exist_ok=True)
 
     # 1. Download inputs by URI scheme
@@ -1062,7 +1178,6 @@ def run_passthrough(inputs: dict | None, command: str, outputs: list | None,
     # 3. Upload outputs (passthrough only uploads when results_root resolves
     # to S3 — mount/ephemeral paths are already where the user's command
     # wrote them, so there's nothing to copy).
-    results_root, results_kind = _resolve_results_root(job_id)
     uploaded = 0
     if results_kind == "s3":
         for path in outputs:
@@ -1088,9 +1203,14 @@ def run_passthrough(inputs: dict | None, command: str, outputs: list | None,
 # Public entrypoint builder
 # ---------------------------------------------------------------------------
 
-_DEFAULT_INSTALL_DEPS = (
-    "fsspec>=2024.6.0 's3fs>=2024.6.0' toml pandas pyyaml huggingface_hub"
-)
+_DEFAULT_INSTALL_DEPS = shlex.join((
+    "fsspec>=2024.6.0",
+    "s3fs>=2024.6.0",
+    "toml",
+    "pandas",
+    "pyyaml",
+    "huggingface_hub",
+))
 
 
 def _resolve_results_root(job_id: str) -> tuple[str, str]:
@@ -1216,28 +1336,75 @@ def build_entrypoint(
     ``huggingface_hub``) are pip-installed at the top of the command.
     ``tao_sdk`` itself is NOT installed — this module is inlined.
     """
+    # Keep this import local: the file is also executed inside containers where
+    # the SDK package itself is intentionally not installed.
+    from tao_sdk.spec_serialization import normalize_data, normalize_specs
+
     if specs is not None and args is not None:
         raise ValueError("Pass either `specs` or `args`, not both.")
 
+    normalized_outputs = normalize_data(
+        outputs if outputs is not None else ([] if specs is None and args is None else {}),
+        root="outputs",
+    )
+
     if specs is not None:
+        if not isinstance(config_format, str):
+            raise TypeError("config_format must be one of: json, yaml, toml")
+        config_format = config_format.lower()
+        if config_format not in {"json", "yaml", "toml"}:
+            raise ValueError("config_format must be one of: json, yaml, toml")
         mode = "config"
-        payload = json.dumps(specs)
+        normalized_payload = normalize_specs(specs)
+        if config_format == "toml":
+            # The runtime fills declared output paths before writing the TOML
+            # file. Probe a copy with only those null placeholders replaced so
+            # unrelated nulls still fail at entrypoint construction time.
+            toml_probe = json.loads(json.dumps(normalized_payload, allow_nan=False))
+            output_keys = (
+                list(normalized_outputs)
+                if isinstance(normalized_outputs, (dict, list))
+                else []
+            )
+            if not all(isinstance(key, str) for key in output_keys):
+                raise TypeError("outputs must declare string spec paths")
+            _autofill_output_destinations(
+                toml_probe,
+                None,
+                normalized_outputs,
+                "/tmp/tao-results",
+            )
+            normalize_specs(toml_probe, allow_none=False)
     elif args is not None:
         mode = "args"
-        payload = json.dumps(args)
+        normalized_payload = normalize_data(args, root="args")
     else:
         mode = "passthrough"
-        payload = "{}"  # script_runner.main() requires --specs even in passthrough
+        normalized_payload = {}
+    payload = json.dumps(normalized_payload, allow_nan=False)
 
     runner_source = Path(__file__).read_text(encoding="utf-8")
     runner_b64 = base64.b64encode(runner_source.encode("utf-8")).decode("ascii")
 
-    inputs_json = json.dumps(inputs or {})
-    outputs_json = json.dumps(
-        outputs if outputs is not None else ([] if mode == "passthrough" else {})
+    inputs_json = json.dumps(
+        normalize_data(
+            {} if inputs is None else inputs,
+            root="inputs",
+        ),
+        allow_nan=False,
     )
-    excludes_json = json.dumps(upload_excludes or [])
-    flags_json = json.dumps(flags or [])
+    outputs_json = json.dumps(normalized_outputs, allow_nan=False)
+    excludes_json = json.dumps(
+        normalize_data(
+            [] if upload_excludes is None else upload_excludes,
+            root="upload_excludes",
+        ),
+        allow_nan=False,
+    )
+    flags_json = json.dumps(
+        normalize_data([] if flags is None else flags, root="flags"),
+        allow_nan=False,
+    )
 
     cli = [
         "python /tmp/_tao_runner.py",

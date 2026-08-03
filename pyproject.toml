@@ -22,8 +22,12 @@ docker = ["docker>=6.0"]
 slurm = []
 # Kubernetes handler — uses the official kubernetes Python client.
 kubernetes = ["kubernetes>=28.0"]
+# Direct local Python execution; the interpreter itself lives in the user-provided venv.
+virtualenv = []
+# Optional TOML writer for VirtualEnvSDK config serialization.
+toml = ["tomli-w>=1.0"]
 # Convenience meta-extra.
-all = ["nvidia-tao-sdk[brev,docker,slurm,kubernetes]"]
+all = ["nvidia-tao-sdk[brev,docker,slurm,kubernetes,virtualenv,toml]"]
 dev = [
     "nvidia-tao-sdk[all]",
     "pytest>=7.0",
@@ -33,6 +37,8 @@ dev = [
     # runtime dependency — the container pip-installs it via _DEFAULT_INSTALL_DEPS
     # (see script_runner.py), and build_entrypoint never touches it.
     "fsspec",
+    "numpy>=1.24",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.entry-points."tao_sdk.platforms"]

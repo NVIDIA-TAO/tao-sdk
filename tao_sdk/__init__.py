@@ -18,7 +18,10 @@ that needs direct API access.
 
 from tao_sdk.job_store import JobStore
 from tao_sdk.models import Checkpoint, CredentialError, Job, JobStatus
+from tao_sdk.platforms.protocol import ArtifactCleanupSDK, PythonScriptSDK
+from tao_sdk.platforms.virtualenv import VirtualEnvSDK
 
 __all__ = [
     "Job", "JobStatus", "Checkpoint", "CredentialError", "JobStore",
+    "ArtifactCleanupSDK", "PythonScriptSDK", "VirtualEnvSDK",
 ]
