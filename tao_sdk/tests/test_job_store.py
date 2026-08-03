@@ -4,6 +4,9 @@
 """Tests for tao_sdk.job_store."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from tao_sdk.job_store import JobStore
@@ -58,6 +61,24 @@ class TestJobCRUD:
         assert job["status"] == "Running"
         assert job["last_epoch"] == 5
 
+    def test_compare_and_set_status_only_matches_expected_state(self, store):
+        store.create_job("j-1", "clip", "train", "ws-1")
+
+        assert store.compare_and_set_job_status("j-1", ("Pending",), "Running")
+        assert not store.compare_and_set_job_status("j-1", ("Pending",), "Canceled")
+        assert store.get_job("j-1")["status"] == "Running"
+
+    def test_backend_registration_does_not_overwrite_terminal_status(self, store):
+        store.create_job("j-1", "clip", "train", "ws-1")
+
+        assert store.update_job_backend_id("j-1", "1234", status="Running")
+        assert store.compare_and_set_job_status("j-1", ("Running",), "Canceled")
+        assert not store.update_job_backend_id("j-1", "5678", status="Running")
+
+        job = store.get_job("j-1")
+        assert job["backend_job_id"] == "1234"
+        assert job["status"] == "Canceled"
+
     def test_list_jobs(self, store):
         store.create_job("j-1", "clip", "train", "ws-1")
         store.create_job("j-2", "cosmos-rl", "train", "ws-1")
@@ -85,12 +106,120 @@ class TestJobCRUD:
         stored_specs = json.loads(job["specs"])
         assert stored_specs["train"]["num_epochs"] == 10
 
+    def test_update_job_specs_preserves_lifecycle_fields(self, store):
+        store.create_job(
+            "j-1",
+            "clip",
+            "train",
+            "ws-1",
+            specs={"before": True},
+            status="Running",
+        )
+        before = store.get_job("j-1")
+
+        assert store.update_job_specs("j-1", {"after": {"value": 2}})
+
+        after = store.get_job("j-1")
+        assert json.loads(after["specs"]) == {"after": {"value": 2}}
+        assert after["status"] == "Running"
+        assert after["created_at"] == before["created_at"]
+
+    def test_create_job_rejects_non_dictionary_specs(self, store):
+        with pytest.raises(TypeError, match="dictionary or None"):
+            store.create_job("j-1", "clip", "train", "ws-1", specs=[])
+
+    def test_create_job_rejects_non_finite_specs(self, store):
+        with pytest.raises(ValueError):
+            store.create_job(
+                "j-1", "clip", "train", "ws-1", specs={"lr": float("nan")}
+            )
+
+    def test_create_job_rejects_non_string_nested_spec_keys(self, store):
+        with pytest.raises(TypeError, match="mapping keys must be strings"):
+            store.create_job(
+                "j-1",
+                "clip",
+                "train",
+                "ws-1",
+                specs={"labels": {1: "integer", "1": "string"}},
+            )
+
+        assert store.get_job("j-1") is None
+
     def test_create_job_insert_or_replace(self, store):
         store.create_job("j-1", "clip", "train", "ws-1", status="Pending")
         store.create_job("j-1", "clip", "train", "ws-1",
                          backend_job_id="tao-job-j-1", status="Pending")
         job = store.get_job("j-1")
         assert job["backend_job_id"] == "tao-job-j-1"
+
+    def test_shared_connection_serializes_through_cursor_fetch(self, store):
+        store.create_job("j-1", "clip", "train", "ws-1")
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        writer_executed = threading.Event()
+        real_connection = store._conn  # noqa: SLF001
+
+        class BlockingCursor:
+            def __init__(self, cursor):
+                self._cursor = cursor
+
+            def fetchone(self):
+                fetch_started.set()
+                assert release_fetch.wait(timeout=5)
+                return self._cursor.fetchone()
+
+        class ObservedConnection:
+            def execute(self, query, parameters=()):
+                normalized = " ".join(query.split())
+                if normalized.startswith("UPDATE jobs SET status ="):
+                    writer_executed.set()
+                cursor = real_connection.execute(query, parameters)
+                if normalized.startswith(
+                    "SELECT * FROM jobs WHERE job_id = ?"
+                ):
+                    return BlockingCursor(cursor)
+                return cursor
+
+            def __getattr__(self, name):
+                return getattr(real_connection, name)
+
+        class ObservedRLock:
+            def __init__(self):
+                self._lock = threading.RLock()
+                self._guard = threading.Lock()
+                self._attempts = 0
+                self.second_attempted = threading.Event()
+
+            def __enter__(self):
+                with self._guard:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        self.second_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self._lock.release()
+
+        observed_lock = ObservedRLock()
+        store._conn = ObservedConnection()  # noqa: SLF001
+        store._lock = observed_lock  # noqa: SLF001
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reader = pool.submit(store.get_job, "j-1")
+            try:
+                assert fetch_started.wait(timeout=5)
+                writer = pool.submit(store.update_job_status, "j-1", "Running")
+                assert observed_lock.second_attempted.wait(timeout=5)
+                assert not writer_executed.is_set()
+            finally:
+                release_fetch.set()
+            assert reader.result(timeout=5)["job_id"] == "j-1"
+            assert writer.result(timeout=5)
+
+        assert writer_executed.is_set()
+        assert store.get_job("j-1")["status"] == "Running"
 
 
 # ---------------------------------------------------------------------------

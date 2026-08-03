@@ -6,11 +6,11 @@
 import time
 
 import pytest
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 from tao_sdk.job_store import JobStore
 from tao_sdk.models import Job
-from tao_sdk.monitor import JobMonitor, _WatchEntry
+from tao_sdk.monitor import JobMonitor
 
 
 @pytest.fixture
@@ -48,6 +48,33 @@ class TestJobMonitor:
     def test_watch_registers_job(self, monitor, sample_job, mock_handler):
         monitor.watch(sample_job, {}, mock_handler)
         assert "j-1" in monitor._watched
+
+    def test_watch_short_circuits_existing_durable_terminal_row(
+        self, monitor, sample_job, mock_handler, store
+    ):
+        store.create_job(
+            "j-1", "nvdinov2", "train", "ws-1",
+            backend_type="brev", status="Canceled",
+        )
+
+        monitor.watch(sample_job, {}, mock_handler)
+
+        assert sample_job.status == "Canceled"
+        assert "j-1" not in monitor._watched
+        mock_handler.get_tao_job_status.assert_not_called()
+
+    def test_poll_short_circuits_terminal_row_won_after_watch(
+        self, monitor, sample_job, mock_handler, store
+    ):
+        monitor.watch(sample_job, {}, mock_handler)
+        entry = monitor._watched["j-1"]
+        store.update_job_status("j-1", "Complete")
+
+        monitor._check_one("j-1", entry)
+
+        assert sample_job.status == "Complete"
+        assert "j-1" not in monitor._watched
+        mock_handler.get_tao_job_status.assert_not_called()
 
     def test_start_stop(self, monitor):
         monitor.start()

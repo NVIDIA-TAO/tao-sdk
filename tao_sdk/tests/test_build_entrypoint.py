@@ -17,8 +17,12 @@ from __future__ import annotations
 import base64
 import json
 import re
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from tao_sdk.script_runner import build_entrypoint
@@ -95,6 +99,22 @@ def test_heredoc_writes_to_expected_path():
     assert "> /tmp/_tao_runner.py" in ep["command"]
 
 
+def test_decoded_runner_executes_without_installed_tao_sdk(tmp_path):
+    ep = build_entrypoint(command="x")
+    runner_path = tmp_path / "decoded_runner.py"
+    runner_path.write_text(_decode_heredoc(ep["command"]), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", str(runner_path), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "TAONext Script Runner" in result.stdout
+
+
 def test_pip_install_line_present():
     ep = build_entrypoint(command="x")
     assert "pip install" in ep["command"]
@@ -102,6 +122,35 @@ def test_pip_install_line_present():
     assert "fsspec>=2024.6.0" in ep["command"]
     assert "s3fs>=2024.6.0" in ep["command"]
     assert "huggingface_hub" in ep["command"]
+
+
+def test_pip_install_constraints_are_shell_safe(tmp_path):
+    install_line = build_entrypoint(command="x")["command"].splitlines()[0]
+    captured_args = tmp_path / "pip-args.txt"
+    fake_pip = (
+        "pip() { printf '%s\\n' \"$@\" > "
+        f"{shlex.quote(str(captured_args))}; }}\n"
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", fake_pip + install_line],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert captured_args.read_text(encoding="utf-8").splitlines() == [
+        "install",
+        "fsspec>=2024.6.0",
+        "s3fs>=2024.6.0",
+        "toml",
+        "pandas",
+        "pyyaml",
+        "huggingface_hub",
+    ]
+    assert not (tmp_path / "=2024.6.0").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +186,79 @@ def test_config_mode_forwards_specs_as_json():
     forwarded = json.loads(_extract_arg(ep["command"], "--specs"))
     assert forwarded == specs
     assert "--config-format yaml" in ep["command"]
+
+
+def test_config_mode_normalizes_numpy_without_mutating_caller():
+    specs = {
+        "train": {
+            "lr": np.float64(0.25),
+            "epochs": np.int64(4),
+            "shape": np.array([16, 32]),
+        }
+    }
+
+    ep = build_entrypoint(command="cmd {config_path}", specs=specs)
+
+    assert json.loads(_extract_arg(ep["command"], "--specs")) == {
+        "train": {"lr": 0.25, "epochs": 4, "shape": [16, 32]}
+    }
+    assert isinstance(specs["train"]["epochs"], np.integer)
+    assert isinstance(specs["train"]["shape"], np.ndarray)
+
+
+def test_config_mode_rejects_invalid_values_with_location():
+    with pytest.raises(ValueError, match=r"specs\['lr'\].*finite"):
+        build_entrypoint(command="cmd {config_path}", specs={"lr": float("nan")})
+    with pytest.raises(TypeError, match="mapping keys must be strings"):
+        build_entrypoint(command="cmd {config_path}", specs={1: "value"})
+    with pytest.raises(TypeError, match="TOML does not support null"):
+        build_entrypoint(
+            command="cmd {config_path}", specs={"value": None}, config_format="toml"
+        )
+
+
+def test_toml_allows_null_only_at_declared_output_paths():
+    specs = {"train": {"results_dir": None}, "description": "test"}
+
+    ep = build_entrypoint(
+        command="cmd {config_path}",
+        specs=specs,
+        outputs={"train.results_dir": {"type": "folder"}},
+        config_format="toml",
+    )
+
+    assert json.loads(_extract_arg(ep["command"], "--specs")) == specs
+
+
+def test_toml_allows_composite_declared_output_placeholders():
+    specs = {"output": {"nested": None}, "description": "test"}
+
+    ep = build_entrypoint(
+        command="cmd {config_path}",
+        specs=specs,
+        outputs={"output": {"type": "folder"}},
+        config_format="toml",
+    )
+
+    assert json.loads(_extract_arg(ep["command"], "--specs")) == specs
+
+
+def test_config_mode_rejects_unknown_format():
+    with pytest.raises(ValueError, match="config_format"):
+        build_entrypoint(
+            command="cmd {config_path}", specs={"value": 1}, config_format="ini"
+        )
+
+
+def test_args_mode_normalizes_array_like_values():
+    ep = build_entrypoint(
+        command="cmd --values {values}",
+        args={"values": np.array([np.int64(2), np.int64(4)])},
+    )
+
+    assert json.loads(_extract_arg(ep["command"], "--specs")) == {
+        "values": [2, 4]
+    }
 
 
 def test_upload_excludes_passed_through():

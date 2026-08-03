@@ -14,7 +14,7 @@ At the start of every session:
    **Path A (docker-only, no Python required):**
    - Install docker + `nvidia-container-toolkit`.
    - `docker login nvcr.io` with your NGC API key.
-   - Install the skill bank plugin: `/plugin marketplace add git@github.com:NVIDIA-TAO/tao-skills-bank.git` then `/plugin install tao-skill-bank@tao-skills`.
+   - Install the skill bank plugin: `/plugin marketplace add git@github.com:NVIDIA-TAO/tao-skill-bank.git` then `/plugin install tao-skill-bank@tao-skills`.
    - Use the plugin's skills to construct and run `docker run` commands directly via Bash.
 
    **Path B (docker + SDK for tracking/Lepton/multi-node):**
