@@ -133,6 +133,19 @@ class SlurmHandler(BaseHandler):
         self.use_requeue = self._bool_config("SLURM_USE_REQUEUE", True)
         self.use_srun_logs = self._bool_config("SLURM_USE_SRUN_LOGS", False)
         self.use_sqsh = self._bool_config("SLURM_USE_SQSH", True)
+        self.strict_sqsh = self._validated_bool_config(
+            "SLURM_STRICT_SQSH",
+            False,
+        )
+        if self.strict_sqsh and not self.use_sqsh:
+            raise ValueError(
+                "SLURM_STRICT_SQSH requires SLURM_USE_SQSH to be enabled"
+            )
+        self.max_job_retries = self._validated_int_config(
+            "SLURM_MAX_JOB_RETRIES",
+            MAX_JOB_RETRIES,
+            minimum=0,
+        )
         self.sqsh_cache_dir = (
             self._config_value("SLURM_SQSH_CACHE_DIR")
             or self.base_results_dir
@@ -864,9 +877,10 @@ class SlurmHandler(BaseHandler):
             return "Paused"
         if slurm_status in ("FAILED", "BOOT_FAIL", "DEADLINE", "OUT_OF_MEMORY", "NODE_FAIL"):
             retry_count = int(metadata.get("retry_count", 0))
+            max_job_retries = getattr(self, "max_job_retries", MAX_JOB_RETRIES)
             if (
                 allow_retry
-                and retry_count < MAX_JOB_RETRIES
+                and retry_count < max_job_retries
                 and self._is_retriable_failure(slurm_status, job_id)
             ):
                 success, new_slurm_job_id, error_msg = self._resubmit_failed_job(
@@ -879,7 +893,7 @@ class SlurmHandler(BaseHandler):
                         job_id,
                         (
                             f"Job resubmitted after infrastructure failure "
-                            f"(attempt {retry_count + 1}/{MAX_JOB_RETRIES}); "
+                            f"(attempt {retry_count + 1}/{max_job_retries}); "
                             f"new SLURM Job ID: {new_slurm_job_id}"
                         ),
                     )
@@ -1541,6 +1555,14 @@ class SlurmHandler(BaseHandler):
         if not metadata:
             return False, None, "job metadata not found"
 
+        max_job_retries = getattr(self, "max_job_retries", MAX_JOB_RETRIES)
+        if retry_count >= max_job_retries:
+            return (
+                False,
+                None,
+                f"maximum SLURM retry count ({max_job_retries}) exhausted",
+            )
+
         remote_script = metadata.get("remote_script")
         if not remote_script:
             return False, None, "remote sbatch script path not recorded"
@@ -1589,7 +1611,7 @@ class SlurmHandler(BaseHandler):
         metadata["launch_uncertain"] = False
         metadata["message"] = (
             f"Job resubmitted after infrastructure failure "
-            f"(attempt {retry_count + 1}/{MAX_JOB_RETRIES}); "
+            f"(attempt {retry_count + 1}/{max_job_retries}); "
             f"new SLURM Job ID: {new_slurm_job_id}"
         )
         self._jobs[job_id] = metadata
@@ -1623,7 +1645,12 @@ class SlurmHandler(BaseHandler):
         force_reconvert_latest: bool = False,
         job_id: str | None = None,
     ) -> str:
-        """Prepare a cached SQSH image, falling back to Docker image on failure."""
+        """Prepare a cached SQSH image.
+
+        Registry-image fallback remains the default. ``SLURM_STRICT_SQSH``
+        makes conversion failure fatal so a requested SQSH-only launch cannot
+        silently change container formats.
+        """
         cache_dir = sqsh_cache_dir.rstrip("/")
         sqsh_path = f"{cache_dir}/{self._get_sqsh_filename(image)}"
         is_latest_tag = ":latest" in image or image.endswith(":latest")
@@ -1649,6 +1676,7 @@ class SlurmHandler(BaseHandler):
                 "Starting SQSH conversion for container image (may take 5-30 minutes)",
             )
 
+        conversion_error: Exception | None = None
         try:
             success = self._convert_to_sqsh_via_srun(
                 image=image,
@@ -1667,6 +1695,7 @@ class SlurmHandler(BaseHandler):
                     )
                 return sqsh_path
         except Exception as exc:
+            conversion_error = exc
             logger.warning("SQSH conversion raised for image %s: %s", image, exc)
             logger.debug(traceback.format_exc())
 
@@ -1675,6 +1704,17 @@ class SlurmHandler(BaseHandler):
         if self._check_sqsh_exists(sqsh_path):
             logger.info("Using cached SQSH image from concurrent conversion: %s", sqsh_path)
             return sqsh_path
+
+        if getattr(self, "strict_sqsh", False):
+            message = (
+                "SQSH conversion failed while SLURM_STRICT_SQSH is enabled; "
+                "refusing registry-image fallback"
+            )
+            if job_id:
+                self._set_job_message(job_id, message)
+            if conversion_error is not None:
+                raise RuntimeError(message) from conversion_error
+            raise RuntimeError(message)
 
         if self._bool_config("SLURM_REQUIRE_SQSH", False):
             raise RuntimeError(
@@ -2092,12 +2132,45 @@ class SlurmHandler(BaseHandler):
     def _config_value(self, key: str) -> Any:
         return self._creds.get(key) or os.environ.get(key)
 
+    def _validated_config_value(self, key: str) -> Any:
+        """Resolve a validated setting while preserving explicit falsy values."""
+        if key in self._creds and self._creds[key] not in (None, ""):
+            return self._creds[key]
+        return os.environ.get(key)
+
     def _int_config(self, key: str, default: int) -> int:
         value = self._config_value(key)
         try:
             return int(value) if value not in (None, "") else default
         except (TypeError, ValueError):
             return default
+
+    def _validated_int_config(
+        self,
+        key: str,
+        default: int,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> int:
+        """Read an integer setting without silently accepting invalid input."""
+        value = self._validated_config_value(key)
+        if value in (None, ""):
+            result = default
+        elif isinstance(value, bool):
+            raise ValueError(f"{key} must be an integer")
+        elif isinstance(value, int):
+            result = value
+        elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+            result = int(value)
+        else:
+            raise ValueError(f"{key} must be an integer")
+
+        if minimum is not None and result < minimum:
+            raise ValueError(f"{key} must be greater than or equal to {minimum}")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"{key} must be less than or equal to {maximum}")
+        return result
 
     def _float_config(self, key: str, default: float) -> float:
         value = self._config_value(key)
@@ -2113,6 +2186,22 @@ class SlurmHandler(BaseHandler):
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _validated_bool_config(self, key: str, default: bool) -> bool:
+        """Read a boolean setting and reject ambiguous spellings."""
+        value = self._validated_config_value(key)
+        if value in (None, ""):
+            return default
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+        raise ValueError(
+            f"{key} must be one of true/false, yes/no, on/off, or 1/0"
+        )
 
     def _num_gpus_from_shape(self, resource_shape: str | None) -> int:
         if resource_shape:
