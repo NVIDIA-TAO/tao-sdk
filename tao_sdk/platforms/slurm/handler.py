@@ -133,6 +133,11 @@ class SlurmHandler(BaseHandler):
         self.use_requeue = self._bool_config("SLURM_USE_REQUEUE", True)
         self.use_srun_logs = self._bool_config("SLURM_USE_SRUN_LOGS", False)
         self.use_sqsh = self._bool_config("SLURM_USE_SQSH", True)
+        self.max_job_retries = self._validated_int_config(
+            "SLURM_MAX_JOB_RETRIES",
+            MAX_JOB_RETRIES,
+            minimum=0,
+        )
         self.sqsh_cache_dir = (
             self._config_value("SLURM_SQSH_CACHE_DIR")
             or self.base_results_dir
@@ -2158,12 +2163,45 @@ class SlurmHandler(BaseHandler):
     def _config_value(self, key: str) -> Any:
         return self._creds.get(key) or os.environ.get(key)
 
+    def _validated_config_value(self, key: str) -> Any:
+        """Resolve a validated setting while preserving explicit falsy values."""
+        if key in self._creds and self._creds[key] not in (None, ""):
+            return self._creds[key]
+        return os.environ.get(key)
+
     def _int_config(self, key: str, default: int) -> int:
         value = self._config_value(key)
         try:
             return int(value) if value not in (None, "") else default
         except (TypeError, ValueError):
             return default
+
+    def _validated_int_config(
+        self,
+        key: str,
+        default: int,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> int:
+        """Read an integer setting without silently accepting invalid input."""
+        value = self._validated_config_value(key)
+        if value in (None, ""):
+            result = default
+        elif isinstance(value, bool):
+            raise ValueError(f"{key} must be an integer")
+        elif isinstance(value, int):
+            result = value
+        elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+            result = int(value)
+        else:
+            raise ValueError(f"{key} must be an integer")
+
+        if minimum is not None and result < minimum:
+            raise ValueError(f"{key} must be greater than or equal to {minimum}")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"{key} must be less than or equal to {maximum}")
+        return result
 
     def _float_config(self, key: str, default: float) -> float:
         value = self._config_value(key)

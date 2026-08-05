@@ -132,6 +132,17 @@ def test_zero_cap_disables_timeout_self_requeue(monkeypatch, tmp_path):
     assert "Maximum timeout self-requeue count (0) exhausted" in result.stderr
 
 
+@pytest.mark.parametrize("value", (-1, "-1", "1.5", "many", True))
+def test_retry_cap_rejects_invalid_values(monkeypatch, tmp_path, value):
+    with pytest.raises(ValueError, match="SLURM_MAX_JOB_RETRIES"):
+        _make_handler(monkeypatch, tmp_path, value)
+
+
+def test_retry_cap_accepts_zero_and_positive_values(monkeypatch, tmp_path):
+    assert _make_handler(monkeypatch, tmp_path, 0).max_job_retries == 0
+    assert _make_handler(monkeypatch, tmp_path, "3").max_job_retries == 3
+
+
 @pytest.mark.parametrize(
     ("scheduler_state", "expected"),
     [
