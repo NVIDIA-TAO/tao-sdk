@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verify that a commit message carries a Developer Certificate of Origin sign-off."""
+"""Verify that a commit message carries a Developer Certificate of Origin sign-off.
+
+Takes the path to the commit message file as its only argument, as git supplies
+it at the commit-msg stage, and exits non-zero if no sign-off trailer is present.
+Reading the message file rather than `git log -1` matters: the latter inspects
+the parent commit and would inherit its sign-off. It can also be run directly:
+
+    python .github/hooks/check_dco_signoff.py .git/COMMIT_EDITMSG
+"""
 
 import sys
-
-
 TRAILER = "Signed-off-by:"
 
 
