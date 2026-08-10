@@ -105,8 +105,11 @@ class DockerSDK:
         return {k: os.environ[k] for k in keys if k in os.environ}
 
     def _results_root_prefix(self, mounts: list | None = None) -> str | None:
-        """``/results`` if a bind mount targets it, else ``None`` (script_runner
-        falls back to ``s3://$S3_BUCKET_NAME`` or container-ephemeral)."""
+        """Return ``/results`` when a writable bind mount targets it.
+
+        Otherwise, return ``None`` so the script runner can fall back to the
+        configured S3 bucket or container-ephemeral storage.
+        """
         volumes = self._handler._build_volumes(mounts)  # noqa: SLF001
         for config in (volumes or {}).values():
             if (
@@ -441,6 +444,7 @@ class DockerSDK:
     # ------------------------------------------------------------------
 
     def get_job_status(self, job_id: str) -> JobStatus:
+        """Return the current durable and live status for ``job_id``."""
         job = self._jobs.get(job_id) or self._load_job_from_store(job_id)
         if not job:
             return JobStatus(job_id=job_id, status="Unknown", message="Job not found")
@@ -472,6 +476,7 @@ class DockerSDK:
         return JobStatus(job_id=job_id, status=status, message=message)
 
     def get_job_logs(self, job_id: str, tail: int | None = None) -> str:
+        """Return captured logs for ``job_id`` when the job is known."""
         job = self._jobs.get(job_id) or self._load_job_from_store(job_id)
         if not job or not self._backend_identity_matches(job_id):
             return ""
@@ -479,6 +484,7 @@ class DockerSDK:
         return logs or ""
 
     def cancel_job(self, job_id: str) -> bool:
+        """Cancel ``job_id`` and persist its terminal state."""
         job = self._jobs.get(job_id) or self._load_job_from_store(job_id)
         if not job or not self._backend_identity_matches(job_id):
             return False
@@ -499,6 +505,7 @@ class DockerSDK:
         return success
 
     def get_failure_analysis(self, job_id: str) -> dict | None:
+        """Return platform-specific failure details for ``job_id``."""
         job = self._jobs.get(job_id) or self._load_job_from_store(job_id)
         if not job or not self._backend_identity_matches(job_id):
             return None
@@ -507,6 +514,7 @@ class DockerSDK:
         return None
 
     def get_job_results_dir(self, job_id: str) -> str:
+        """Return the local or remote results directory for ``job_id``."""
         entry = self._store.get_job(job_id)
         if not entry:
             return ""
@@ -637,6 +645,7 @@ class DockerSDK:
     # ------------------------------------------------------------------
 
     def check_path(self, remote_path: str) -> bool:
+        """Return whether ``remote_path`` exists in the configured storage."""
         try:
             fs = self._get_fs()
             path = remote_path.split("://", 1)[1] if "://" in remote_path else remote_path
@@ -646,6 +655,7 @@ class DockerSDK:
             return False
 
     def list_path(self, remote_path: str) -> list[str]:
+        """List entry names below ``remote_path`` in configured storage."""
         try:
             fs = self._get_fs()
             path = remote_path.split("://", 1)[1] if "://" in remote_path else remote_path

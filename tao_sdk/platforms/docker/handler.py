@@ -831,7 +831,7 @@ class DockerHandler(BaseHandler):
         try:
             self._client.ping()
         except AttributeError:
-            return
+            pass
 
     def _ensure_network(self, job_id: str):
         """Ensure the configured Docker network exists before container launch."""
@@ -954,8 +954,8 @@ class DockerHandler(BaseHandler):
                 raise
             try:
                 replacement = self._client.containers.get(container_name)
-            except self._not_found_errors:
-                raise original
+            except self._not_found_errors as replacement_error:
+                raise original from replacement_error
             replacement_id = str(getattr(replacement, "id", "") or "")
             replacement_description = replacement_id or "an unidentified container"
             raise DockerContainerIdentityError(
