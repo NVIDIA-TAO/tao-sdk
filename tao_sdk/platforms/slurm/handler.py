@@ -630,8 +630,7 @@ class SlurmHandler(BaseHandler):
         exclusive = False
         if num_gpus >= self.max_num_gpus:
             computed_nodes = math.ceil(num_gpus / self.max_num_gpus)
-            if computed_nodes > num_nodes:
-                num_nodes = computed_nodes
+            num_nodes = max(num_nodes, computed_nodes)
             num_gpus = self.max_num_gpus
             exclusive = True
 
@@ -959,6 +958,7 @@ class SlurmHandler(BaseHandler):
         return "Complete" if raw_status is None else raw_status
 
     def get_job_message(self, job_id: str) -> str:
+        """Return the latest user-facing message for ``job_id``."""
         metadata = self._get_job_metadata(job_id)
         return self._job_messages.get(job_id) or (metadata or {}).get("message", "")
 
@@ -1033,7 +1033,7 @@ class SlurmHandler(BaseHandler):
             return False
 
         all_quiescent = True
-        for slurm_job_id, _listed_status in candidates:
+        for slurm_job_id, _ in candidates:
             force_known_id = bool(
                 metadata.get("submission_attempted")
                 and str(metadata.get("slurm_job_id", "") or "") == slurm_job_id
@@ -1135,6 +1135,7 @@ class SlurmHandler(BaseHandler):
         return False
 
     def delete_job(self, job_id: str) -> bool:
+        """Cancel a job through the SDK-compatible delete alias."""
         return self.cancel_job(job_id)
 
     def get_canonical_results_root(self) -> str:
@@ -1166,14 +1167,17 @@ class SlurmHandler(BaseHandler):
             safe_job_id = validate_job_id(job_id)
             recorded_root = PurePosixPath(expected_root)
             configured_base = PurePosixPath(self.base_results_dir)
-            if (
+            recorded_root_invalid = (
                 not recorded_root.is_absolute()
                 or str(recorded_root) == "/"
                 or ".." in recorded_root.parts
-                or not configured_base.is_absolute()
+            )
+            configured_base_invalid = (
+                not configured_base.is_absolute()
                 or str(configured_base) == "/"
                 or ".." in configured_base.parts
-            ):
+            )
+            if recorded_root_invalid or configured_base_invalid:
                 raise ValueError("recorded SLURM results root is not safely scoped")
         except ValueError as exc:
             logger.warning("Could not validate artifacts for job %s: %s", job_id, exc)
@@ -1201,6 +1205,7 @@ class SlurmHandler(BaseHandler):
         return False
 
     def delete(self, job_id: str) -> bool:
+        """Cancel a job through the generic SDK delete alias."""
         return self.cancel_job(job_id)
 
     def get_available_instances(self, **kwargs) -> dict:
@@ -1238,6 +1243,7 @@ class SlurmHandler(BaseHandler):
         return instances
 
     def get_job_replicas(self, job_id: str) -> list[dict]:
+        """Return active scheduler replicas associated with ``job_id``."""
         metadata = self._get_job_metadata(job_id)
         if not metadata or not metadata.get("slurm_job_id"):
             return []
@@ -1262,6 +1268,7 @@ class SlurmHandler(BaseHandler):
         return replicas
 
     def get_failure_analysis(self, job_id: str) -> dict | None:
+        """Inspect recent logs for a known retriable failure pattern."""
         logs = self.get_job_logs(job_id, tail_lines=500)
         if not logs:
             return None
@@ -1583,6 +1590,7 @@ class SlurmHandler(BaseHandler):
         return "NOT_FOUND"
 
     def get_slurm_job_id_from_output(self, sbatch_output: str) -> str | None:
+        """Extract a numeric SLURM job ID from ``sbatch`` output."""
         match = re.search(r"Submitted batch job\s+(\d+)", sbatch_output or "")
         return match.group(1) if match else None
 
@@ -1886,6 +1894,7 @@ class SlurmHandler(BaseHandler):
         return result.returncode == 0 and result.stdout.strip() == "exists"
 
     def check_path_exists(self, remote_path: str) -> bool:
+        """Return whether ``remote_path`` exists on the remote host."""
         result = self._ssh(
             f"test -e {shlex.quote(remote_path)} && echo exists || echo not_found",
             check=False,
@@ -1894,6 +1903,7 @@ class SlurmHandler(BaseHandler):
         return result.returncode == 0 and result.stdout.strip() == "exists"
 
     def test_ssh_connection(self) -> tuple[bool, str]:
+        """Check SSH connectivity and return status plus diagnostic text."""
         result = self._ssh(
             "echo 'SSH connection successful'",
             check=False,
@@ -2475,10 +2485,10 @@ class SlurmHandler(BaseHandler):
         lock_path = STATE_PATH.with_suffix(STATE_PATH.suffix + ".lock")
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("w") as lock_file:
+            with lock_path.open("w", encoding="utf-8") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_SH)
                 if STATE_PATH.exists():
-                    loaded = json.loads(STATE_PATH.read_text())
+                    loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
                     if isinstance(loaded, dict):
                         return loaded
         except Exception as exc:
@@ -2490,18 +2500,21 @@ class SlurmHandler(BaseHandler):
         tmp_path = STATE_PATH.with_name(f"{STATE_PATH.name}.{os.getpid()}.tmp")
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            with lock_path.open("w") as lock_file:
+            with lock_path.open("w", encoding="utf-8") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
                 existing = {}
                 if STATE_PATH.exists():
                     try:
-                        loaded = json.loads(STATE_PATH.read_text())
+                        loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
                         if isinstance(loaded, dict):
                             existing = loaded
                     except Exception:
                         logger.warning("Ignoring unreadable SLURM state file during save: %s", STATE_PATH)
                 existing.update(self._jobs)
-                tmp_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
+                tmp_path.write_text(
+                    json.dumps(existing, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
                 os.replace(tmp_path, STATE_PATH)
         except Exception as exc:
             logger.warning("Failed to write SLURM state file %s: %s", STATE_PATH, exc)
