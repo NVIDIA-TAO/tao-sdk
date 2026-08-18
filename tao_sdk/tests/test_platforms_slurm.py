@@ -10,6 +10,8 @@ for unit tests.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 
@@ -89,6 +91,55 @@ def test_results_root_prefix_is_lustre_path():
     sdk = object.__new__(SlurmSDK)
     sdk._handler = handler
     assert sdk._results_root_prefix() == "/lustre/fsw/tao/results"
+
+
+def test_slurm_script_explicitly_disables_cluster_requeue_default():
+    from tao_sdk.platforms.slurm.handler import SlurmHandler
+    handler = SlurmHandler(
+        slurm_user="alice", slurm_hostnames=["login01"],
+        base_results_dir="/lustre/fsw/tao",
+    )
+    script = handler._build_slurm_script(
+        job_name="tao-job-test", num_nodes=1, num_gpus=8,
+        cpus_per_task=248, time_hours=4, account="account",
+        partition="polar3", log_dir="/lustre/fsw/tao/logs",
+        mail_user=None, image="/lustre/fsw/tao/image.sqsh",
+        container_mounts="/lustre:/lustre", use_timeout=True,
+        timeout_hours=3.8, use_requeue=False, use_srun=False,
+        command="echo ok", docker_env_vars={}, exclusive=True,
+    )
+    assert "#SBATCH --no-requeue" in script
+    assert "#SBATCH --requeue\n" not in script
+
+
+def test_find_checkpoint_paths_includes_cosmos_policy_and_generic_files():
+    from tao_sdk.platforms.slurm.handler import SlurmHandler
+    handler = SlurmHandler(
+        slurm_user="alice", slurm_hostnames=["login01"],
+        base_results_dir="/lustre/fsw/tao",
+    )
+    seen = {}
+
+    def fake_ssh(command, **kwargs):
+        seen["command"] = command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "/lustre/fsw/tao/results/job/epoch_1/policy\n"
+                "/lustre/fsw/tao/results/job/model.ckpt\n"
+                "/lustre/fsw/tao/results/job/epoch_1/policy\n"
+            ),
+        )
+
+    handler._ssh = fake_ssh
+    assert handler.find_checkpoint_paths(
+        "lustre:///lustre/fsw/tao/results/job"
+    ) == [
+        "/lustre/fsw/tao/results/job/epoch_1/policy",
+        "/lustre/fsw/tao/results/job/model.ckpt",
+    ]
+    assert "cosmos_config" in seen["command"]
+    assert "*.ckpt" in seen["command"]
 
 
 def test_results_root_prefix_uses_handler_default_when_not_set():

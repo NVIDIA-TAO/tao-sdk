@@ -167,6 +167,14 @@ class SlurmSDK:
 
         container_env["TAO_JOB_ID"] = job_id
         container_env["TAO_RESULTS_ROOT"] = canonical_results_root
+        # Source-baked TAO loggers use the API identity while script_runner
+        # uses TAO_JOB_ID.  They must identify the same job so container
+        # SUCCESS/FAIL events land beside the SDK-owned artifacts.
+        container_env["TAO_API_JOB_ID"] = job_id
+        container_env["TAO_STATUS_FILE"] = (
+            f"{canonical_results_root}/{job_id}/status.json"
+        )
+        container_env["TAO_STATUS_PATH"] = container_env["TAO_STATUS_FILE"]
 
         cloud_metadata = self._build_cloud_metadata()
 
@@ -441,14 +449,14 @@ class SlurmSDK:
         return self._store.list_jobs(status=status)
 
     def get_checkpoints(self, job_id: str) -> list[str]:
-        """List checkpoint files in the job's results dir, filtered by extension.
-
-        For ``lustre://`` results dirs, listing is currently not implemented —
-        returns an empty list. S3-backed results dirs work via ``list_path``.
-        """
+        """List checkpoint artifacts in the job's results directory."""
         results = self.get_job_results_dir(job_id)
-        if not results or results.startswith("lustre://"):
+        if not results:
             return []
+        if results.startswith("lustre://"):
+            if not self._backend_identity_matches(job_id):
+                return []
+            return self._handler.find_checkpoint_paths(results)
         try:
             files = self.list_path(results)
         except Exception:

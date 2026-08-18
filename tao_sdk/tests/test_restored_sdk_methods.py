@@ -71,11 +71,30 @@ def test_get_checkpoints_handles_listing_failure():
     assert sdk.get_checkpoints("job-1") == []
 
 
-def test_slurm_get_checkpoints_skips_lustre():
-    """SLURM's get_checkpoints returns [] for lustre:// (no listing impl yet)."""
+def test_slurm_get_checkpoints_lists_verified_lustre_artifacts():
     from tao_sdk.platforms.slurm import SlurmSDK
     sdk = SlurmSDK.__new__(SlurmSDK)
     sdk.get_job_results_dir = lambda job_id: "lustre:///lustre/fsw/.../results/job-1"
+    sdk._backend_identity_matches = lambda job_id: True
+    class Handler:
+        def find_checkpoint_paths(self, path):
+            assert path == "lustre:///lustre/fsw/.../results/job-1"
+            return [
+                "/lustre/fsw/.../checkpoints/epoch_1/policy",
+                "/lustre/fsw/.../model.ckpt",
+            ]
+    sdk._handler = Handler()
+    assert sdk.get_checkpoints("job-1") == [
+        "/lustre/fsw/.../checkpoints/epoch_1/policy",
+        "/lustre/fsw/.../model.ckpt",
+    ]
+
+
+def test_slurm_get_checkpoints_rejects_unverified_backend():
+    from tao_sdk.platforms.slurm import SlurmSDK
+    sdk = SlurmSDK.__new__(SlurmSDK)
+    sdk.get_job_results_dir = lambda job_id: "lustre:///lustre/fsw/results/job-1"
+    sdk._backend_identity_matches = lambda job_id: False
     assert sdk.get_checkpoints("job-1") == []
 
 

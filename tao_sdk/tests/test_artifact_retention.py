@@ -1196,6 +1196,12 @@ def test_slurm_sdk_surfaces_definitive_scheduler_rejection():
 
     sdk._handler.cancel_job.assert_not_called()
     sdk._store.update_job_status.assert_called_once_with("job-1", "Error")
+    container_env = sdk._handler.create_job.call_args.kwargs["docker_env_vars"]
+    assert container_env["TAO_JOB_ID"] == "job-1"
+    assert container_env["TAO_API_JOB_ID"] == "job-1"
+    assert container_env["TAO_RESULTS_ROOT"] == "/lustre/results"
+    assert container_env["TAO_STATUS_FILE"] == "/lustre/results/job-1/status.json"
+    assert container_env["TAO_STATUS_PATH"] == "/lustre/results/job-1/status.json"
 
 
 def test_slurm_sdk_preserves_transport_ambiguous_submission():

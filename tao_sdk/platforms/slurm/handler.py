@@ -1316,6 +1316,10 @@ class SlurmHandler(BaseHandler):
             ])
         if use_requeue:
             script_lines.append("#SBATCH --requeue")
+        else:
+            # Absence of --requeue does not disable a cluster/account default.
+            # Emit the explicit inverse required by the platform contract.
+            script_lines.append("#SBATCH --no-requeue")
 
         script_lines.extend([
             "",
@@ -1821,6 +1825,35 @@ class SlurmHandler(BaseHandler):
             timeout=TIMEOUT_SECONDS,
         )
         return result.returncode == 0 and result.stdout.strip() == "exists"
+
+    def find_checkpoint_paths(self, remote_path: str) -> list[str]:
+        """Return checkpoint artifacts below an absolute shared-Lustre path.
+
+        Cosmos-RL promotions resume from the ``policy`` directory containing
+        ``cosmos_config`` rather than from the HF safetensors export. Include
+        those directories alongside generic checkpoint files.
+        """
+        path = remote_path.removeprefix("lustre://")
+        if not path.startswith("/") or ".." in PurePosixPath(path).parts:
+            raise ValueError("checkpoint search path must be an absolute scoped path")
+        file_names = (
+            "*.pth", "*.pth.tar", "*.tlt", "*.hdf5", "*.pt", "*.ckpt",
+            "*.engine", "*.onnx", "*.trt",
+        )
+        name_expr = " -o ".join(
+            f"-name {shlex.quote(pattern)}" for pattern in file_names
+        )
+        command = (
+            f"find {shlex.quote(path)} "
+            f"\\( -type f \\( {name_expr} \\) -print \\) -o "
+            "\\( -type f -name cosmos_config -printf '%h\\n' \\)"
+        )
+        result = self._ssh(command, check=False, timeout=60)
+        if result.returncode != 0:
+            return []
+        return list(dict.fromkeys(
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        ))
 
     def test_ssh_connection(self) -> tuple[bool, str]:
         result = self._ssh(
