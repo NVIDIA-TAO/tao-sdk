@@ -1628,6 +1628,17 @@ class SlurmHandler(BaseHandler):
         job_id: str | None = None,
     ) -> str:
         """Prepare a cached SQSH image, falling back to Docker image on failure."""
+        # A caller-supplied SQSH is already the native Pyxis image artifact.
+        # Use it directly: it must not be treated as a registry reference and
+        # sent through enroot import or copied into the SDK cache.
+        if image.startswith("/") and image.endswith(".sqsh"):
+            if not self.check_path_exists(image):
+                raise FileNotFoundError(f"caller-supplied SQSH does not exist: {image}")
+            logger.info("Using caller-supplied SQSH image directly: %s", image)
+            if job_id:
+                self._set_job_message(job_id, "Using caller-supplied SQSH image directly")
+            return image
+
         cache_dir = sqsh_cache_dir.rstrip("/")
         sqsh_path = f"{cache_dir}/{self._get_sqsh_filename(image)}"
         is_latest_tag = ":latest" in image or image.endswith(":latest")

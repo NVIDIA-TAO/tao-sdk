@@ -375,6 +375,37 @@ def test_sqsh_conversion_writes_partial_then_renames(monkeypatch):
     assert any(c.startswith("scancel --jobname=tao-sqsh-") for c in calls)
 
 
+def test_caller_supplied_sqsh_is_used_directly_without_conversion(monkeypatch):
+    """An explicit native SQSH path is an input identity, not a Docker URI."""
+    from tao_sdk.platforms.slurm.handler import SlurmHandler
+
+    handler = SlurmHandler(slurm_user="alice", slurm_hostnames=["login01"])
+    image = "/lustre/images/cosmos.sqsh"
+    monkeypatch.setattr(handler, "check_path_exists", lambda path: path == image)
+    monkeypatch.setattr(
+        handler,
+        "_convert_to_sqsh_via_srun",
+        lambda **kwargs: pytest.fail("native SQSH must not be converted"),
+    )
+
+    assert handler._prepare_container_image(image, "/lustre/cache") == image
+
+
+def test_missing_caller_supplied_sqsh_fails_before_conversion(monkeypatch):
+    from tao_sdk.platforms.slurm.handler import SlurmHandler
+
+    handler = SlurmHandler(slurm_user="alice", slurm_hostnames=["login01"])
+    monkeypatch.setattr(handler, "check_path_exists", lambda path: False)
+    monkeypatch.setattr(
+        handler,
+        "_convert_to_sqsh_via_srun",
+        lambda **kwargs: pytest.fail("missing native SQSH must not be converted"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="caller-supplied SQSH"):
+        handler._prepare_container_image("/lustre/images/missing.sqsh", "/lustre/cache")
+
+
 def test_sqsh_conversion_waits_on_in_flight_writer(monkeypatch):
     """A second session must wait on an in-flight conversion of the same
     image instead of starting a concurrent writer."""
