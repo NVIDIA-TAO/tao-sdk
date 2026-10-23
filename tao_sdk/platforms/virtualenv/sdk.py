@@ -92,18 +92,20 @@ def _active_group_members():
     try:
         proc_entries = os.scandir("/proc")
     except OSError:
-        result = subprocess.run(
+        # The ps helper shares this process group; track its pid so it is not
+        # reported as a leaked group member.
+        ps_proc = subprocess.Popen(
             ["ps", "-eo", "pid=,pgid=,stat="],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=False,
         )
-        if result.returncode != 0:
+        ps_out, ps_err = ps_proc.communicate()
+        if ps_proc.returncode != 0:
             raise RuntimeError(
-                "cannot enumerate process group: " + result.stderr.strip()
+                "cannot enumerate process group: " + ps_err.strip()
             )
-        for line in result.stdout.splitlines():
+        for line in ps_out.splitlines():
             fields = line.split()
             if len(fields) < 3:
                 continue
@@ -113,7 +115,7 @@ def _active_group_members():
             except ValueError:
                 continue
             state = fields[2]
-            if pid != own_pid and process_group == group_id and not state.startswith("Z"):
+            if pid not in (own_pid, ps_proc.pid) and process_group == group_id and not state.startswith("Z"):
                 members.append(pid)
         return members
     with proc_entries:
