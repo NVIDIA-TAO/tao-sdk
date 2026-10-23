@@ -21,6 +21,7 @@ import pytest
 
 from tao_sdk.job_store import JobStore
 from tao_sdk.platforms.virtualenv import VirtualEnvSDK
+from tao_sdk.platforms.virtualenv.sdk import _JOB_WRAPPER_SOURCE
 
 
 @pytest.fixture(scope="module")
@@ -1096,3 +1097,31 @@ def test_result_reader_rejects_directory_traversal(sdk):
     (sdk.jobs_dir / "path-test" / "results").mkdir(parents=True)
     with pytest.raises(ValueError, match="stay within"):
         sdk.read_job_result_file("path-test", "../metadata.json")
+
+
+def test_launcher_ps_fallback_does_not_count_its_own_helper():
+    # Without /proc (macOS) the launcher enumerates its group with `ps`; that
+    # helper shares the group and must not be reported as a leaked member.
+    harness = (
+        "import os, sys\n"
+        "real_scandir = os.scandir\n"
+        "def scandir(path='.'):\n"
+        "    if str(path) == '/proc':\n"
+        "        raise OSError('no /proc')\n"
+        "    return real_scandir(path)\n"
+        "os.scandir = scandir\n"
+        "namespace = {'__name__': 'launcher'}\n"
+        "exec(compile(sys.stdin.read(), 'launch_job.py', 'exec'), namespace)\n"
+        "print(namespace['_active_group_members']())\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", harness],
+        input=_JOB_WRAPPER_SOURCE,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        start_new_session=True,  # own process group: no other live members
+        check=True,
+    )
+
+    assert result.stdout.strip() == "[]"
