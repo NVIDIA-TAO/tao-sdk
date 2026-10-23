@@ -645,7 +645,7 @@ def test_post_spawn_registration_failure_reaps_process(
     real_popen = subprocess.Popen
 
     def tracking_popen(*args, **kwargs):
-        process = real_popen(*args, **kwargs)
+        process = real_popen(*args, **kwargs)  # pylint: disable=consider-using-with
         spawned.append(process)
         return process
 
@@ -673,7 +673,7 @@ def test_exception_immediately_after_spawn_is_rolled_back(
     real_popen = subprocess.Popen
 
     def tracking_popen(*args, **kwargs):
-        process = real_popen(*args, **kwargs)
+        process = real_popen(*args, **kwargs)  # pylint: disable=consider-using-with
         spawned.append(process)
         return process
 
@@ -925,7 +925,7 @@ def test_pending_record_recovers_if_orchestrator_crashes_after_spawn(
         "sdk._store.update_job_backend_id = lambda *a, **k: os._exit(23)\n"
         f"sdk.create_python_job(script={str(script)!r}, gpu_count=0)\n"
     )
-    crashed = subprocess.run([sys.executable, "-c", source])
+    crashed = subprocess.run([sys.executable, "-c", source], check=False)
     assert crashed.returncode == 23
 
     recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
@@ -957,7 +957,7 @@ def test_recovered_pending_job_can_cancel_without_opening_start_gate(
         "sdk._store.update_job_backend_id = lambda *a, **k: os._exit(25)\n"
         f"sdk.create_python_job(script={str(script)!r}, gpu_count=0)\n"
     )
-    crashed = subprocess.run([sys.executable, "-c", source])
+    crashed = subprocess.run([sys.executable, "-c", source], check=False)
     assert crashed.returncode == 25
 
     recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
@@ -998,7 +998,7 @@ def test_pending_record_stays_nonterminal_if_host_crashes_before_spawn(
         "sdk_module.subprocess.Popen = lambda *a, **k: os._exit(24)\n"
         f"sdk.create_python_job(script={str(script)!r}, gpu_count=0)\n"
     )
-    crashed = subprocess.run([sys.executable, "-c", source])
+    crashed = subprocess.run([sys.executable, "-c", source], check=False)
     assert crashed.returncode == 24
 
     monkeypatch.setattr(sdk_module, "_PENDING_LAUNCH_GRACE_SECONDS", 0.0)
@@ -1146,10 +1146,10 @@ def test_real_job_ps_fallback_preserves_exit_and_cleans_workers(
     )
     monkeypatch.setattr(module, "_JOB_WRAPPER_SOURCE", no_proc + module._JOB_WRAPPER_SOURCE)
     script = _write_script(tmp_path,
-        "import subprocess, sys\n"
-        + ("subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
-           if background else "")
-        + f"sys.exit({return_code})\n")
+                           "import subprocess, sys\n" +
+                           ("subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                            if background else "") +
+                           f"sys.exit({return_code})\n")
     job = sdk.create_python_job(script=script, gpu_count=0)
     status_path = sdk.jobs_dir / job.id / "exit_status.json"
     deadline = time.monotonic() + 15
@@ -1166,9 +1166,9 @@ def test_recovered_cancel_without_pid_identity_uses_launcher(
     real_venv, tmp_path, monkeypatch, ignore_term
 ):
     script = _write_script(tmp_path,
-        "import signal,time\n"
-        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "")
-        + "print('ready', flush=True)\ntime.sleep(60)\n")
+                           "import signal,time\n" +
+                           ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "") +
+                           "print('ready', flush=True)\ntime.sleep(60)\n")
     work_dir, state_file = tmp_path / "jobs", tmp_path / "jobs.db"
     job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
     recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
@@ -1177,6 +1177,7 @@ def test_recovered_cancel_without_pid_identity_uses_launcher(
         assert time.monotonic() < deadline
         time.sleep(0.02)
     monkeypatch.setattr(recovered, "_process_matches", lambda *args: False)
+
     def forbidden_signal(*args, **kwargs):
         pytest.fail("Must not signal a process group without verified identity")
     monkeypatch.setattr(recovered, "_terminate_process_group", forbidden_signal)

@@ -397,8 +397,6 @@ def test_default_state_uses_windows_lock_without_posix_apis(tmp_path):
 
 
 def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
-    import threading
-
     db_path = tmp_path / "legacy-schema.db"
     connection = sqlite3.connect(db_path)
     connection.execute("""
@@ -846,7 +844,7 @@ def test_slurm_launch_fence_is_single_owner_and_terminal_status_blocks_retry(
     first_handler._begin_launch_fence("job-1")  # noqa: SLF001
     second_handler.check_path_exists = MagicMock(return_value=True)
     second_handler._ssh = MagicMock()  # noqa: SLF001
-    success, _scheduler_id, message = second_handler._resubmit_failed_job(  # noqa: SLF001
+    success, _, message = second_handler._resubmit_failed_job(  # noqa: SLF001
         "job-1", failed_slurm_job_id="42", retry_count=0,
     )
     assert success is False
