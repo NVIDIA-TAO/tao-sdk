@@ -1125,3 +1125,36 @@ def test_launcher_ps_fallback_does_not_count_its_own_helper():
     )
 
     assert result.stdout.strip() == "[]"
+
+
+@pytest.mark.parametrize("return_code,background", [(0, False), (7, False), (0, True)])
+def test_real_job_ps_fallback_preserves_exit_and_cleans_workers(
+    sdk, tmp_path, monkeypatch, return_code, background
+):
+    """Exercise the generated launcher, real ps and workers, not mocked ps output."""
+    import tao_sdk.platforms.virtualenv.sdk as module
+
+    no_proc = (
+        "import os\n"
+        "_real_scandir = os.scandir\n"
+        "def _without_proc(path='.'):\n"
+        "    if str(path) == '/proc':\n"
+        "        raise FileNotFoundError('/proc unavailable')\n"
+        "    return _real_scandir(path)\n"
+        "os.scandir = _without_proc\n"
+    )
+    monkeypatch.setattr(module, "_JOB_WRAPPER_SOURCE", no_proc + module._JOB_WRAPPER_SOURCE)
+    script = _write_script(tmp_path,
+        "import subprocess, sys\n"
+        + ("subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+           if background else "")
+        + f"sys.exit({return_code})\n")
+    job = sdk.create_python_job(script=script, gpu_count=0)
+    status_path = sdk.jobs_dir / job.id / "exit_status.json"
+    deadline = time.monotonic() + 15
+    while not status_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    record = json.loads(status_path.read_text())
+    assert record["group_quiescent"] is True, record
+    assert record["return_code"] == return_code, record
+    assert _wait_for_terminal(sdk, job.id).status == ("Error" if return_code else "Complete")
