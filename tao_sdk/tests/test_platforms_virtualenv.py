@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -1158,3 +1159,44 @@ def test_real_job_ps_fallback_preserves_exit_and_cleans_workers(
     assert record["group_quiescent"] is True, record
     assert record["return_code"] == return_code, record
     assert _wait_for_terminal(sdk, job.id).status == ("Error" if return_code else "Complete")
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_recovered_cancel_without_pid_identity_uses_launcher(
+    real_venv, tmp_path, monkeypatch, ignore_term
+):
+    script = _write_script(tmp_path,
+        "import signal,time\n"
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "")
+        + "print('ready', flush=True)\ntime.sleep(60)\n")
+    work_dir, state_file = tmp_path / "jobs", tmp_path / "jobs.db"
+    job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
+    recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
+    deadline = time.monotonic() + 10
+    while "ready" not in recovered.get_job_logs(job_id):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    monkeypatch.setattr(recovered, "_process_matches", lambda *args: False)
+    def forbidden_signal(*args, **kwargs):
+        pytest.fail("Must not signal a process group without verified identity")
+    monkeypatch.setattr(recovered, "_terminate_process_group", forbidden_signal)
+    assert recovered.cancel_job(job_id, timeout=0.2)
+    assert recovered.get_job_status(job_id).status == "Canceled"
+    record = json.loads((recovered.jobs_dir / job_id / "exit_status.json").read_text())
+    assert record["group_quiescent"] is True
+    assert record["return_code"] in {-signal.SIGTERM, -signal.SIGKILL}
+
+
+def test_cooperative_cancel_requires_cleanup_acknowledgement(real_venv, tmp_path, monkeypatch):
+    script = _write_script(tmp_path, "import time\ntime.sleep(60)\n")
+    work_dir, state_file = tmp_path / "jobs", tmp_path / "jobs.db"
+    job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
+    recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
+    with monkeypatch.context() as patch:
+        patch.setattr(recovered, "_process_matches", lambda *args: False)
+        patch.setattr(recovered, "_read_exit_record", lambda *args: None)
+        assert not recovered.cancel_job(job_id, timeout=0.01)
+        assert recovered.get_job_status(job_id).status == "Canceling"
+    # The real launcher acknowledged; a subsequent recovery can finalize it.
+    recovered.cancel_job(job_id, timeout=0.2)
+    assert recovered.get_job_status(job_id).status == "Canceled"

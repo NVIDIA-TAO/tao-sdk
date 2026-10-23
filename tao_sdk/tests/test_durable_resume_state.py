@@ -397,6 +397,8 @@ def test_default_state_uses_windows_lock_without_posix_apis(tmp_path):
 
 
 def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
+    import threading
+
     db_path = tmp_path / "legacy-schema.db"
     connection = sqlite3.connect(db_path)
     connection.execute("""
@@ -422,7 +424,10 @@ def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
     connection.commit()
     connection.close()
 
+    ready = threading.Barrier(8)
+
     def open_store(_index):
+        ready.wait(timeout=10)
         store = JobStore(db_path)
         try:
             return {
@@ -434,10 +439,32 @@ def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
         finally:
             store.close()
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(open_store, range(2)))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(open_store, range(8)))
     for columns in results:
         assert {"plan_id", "step_id", "instance_id"}.issubset(columns)
+
+
+def test_open_waits_for_reader_during_wal_transition(tmp_path):
+    """WAL conversion must tolerate a brief reader lock on a legacy database."""
+    import time
+
+    path = tmp_path / "reader.db"
+    reader = sqlite3.connect(path)
+    reader.execute("CREATE TABLE fixture (value INTEGER)")
+    reader.commit()
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM fixture").fetchall()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(JobStore, path)
+        time.sleep(0.2)
+        reader.rollback()
+        reader.close()
+        store = future.result(timeout=10)
+        try:
+            assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        finally:
+            store.close()
 
 
 def test_monitor_registration_never_replaces_concurrent_terminal_row(tmp_path):

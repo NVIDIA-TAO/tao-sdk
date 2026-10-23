@@ -19,7 +19,7 @@ import sqlite3
 import stat
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -79,7 +79,7 @@ def _prepare_private_state_dir(state_dir: Path) -> None:
 
 @contextmanager
 def _exclusive_migration_lock(lock_path: Path):
-    """Hold a cross-process lock while importing cwd-relative legacy state."""
+    """Hold a cross-process lock across database initialization or migration."""
     with lock_path.open("a+b") as lock_file:
         if _fcntl is not None:
             _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
@@ -408,10 +408,23 @@ class JobStore:
             db_path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_SCHEMA)
-        self._migrate()
+        # Journal-mode conversion precedes SQLite migration transactions and
+        # can race with another opener's schema writes. Serialize the complete
+        # initialization boundary, not just ALTER TABLE. In-memory databases
+        # are private to their connections and need no filesystem sidecar.
+        initialization_lock = (
+            nullcontext() if db_path == ":memory:" else
+            _exclusive_migration_lock(Path(str(Path(db_path).resolve()) + ".init.lock"))
+        )
+        try:
+            with initialization_lock:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.executescript(_SCHEMA)
+                self._migrate()
+        except BaseException:
+            self._conn.close()
+            raise
 
     @_locked_operation
     def _migrate(self) -> None:

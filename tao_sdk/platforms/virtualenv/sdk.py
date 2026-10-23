@@ -197,7 +197,16 @@ def main():
         return 128 + signal.SIGTERM
     error = None
     try:
-        return_code = subprocess.call(command)
+        child = subprocess.Popen(command)
+        while child.poll() is None:
+            if os.path.exists(cancel_path):
+                # The launcher owns this live group. A recovered controller
+                # need not identify or signal a persisted numeric PID.
+                _stop_remaining_group_members()
+                child.wait()
+                break
+            time.sleep(0.05)
+        return_code = child.returncode
     except BaseException as exc:  # Preserve a durable failure record.
         traceback.print_exc()
         return_code = 127
@@ -586,6 +595,7 @@ class VirtualEnvSDK:
             "exit_record_path": str(exit_record_path),
             "start_gate_path": str(start_gate_path),
             "cancel_path": str(cancel_path),
+            "cooperative_cancel": True,
             "cwd": str(launch_cwd),
             "venv_path": str(self.venv_path),
             "config_path": str(config_path),
@@ -1394,6 +1404,7 @@ class VirtualEnvSDK:
                 yield chunk
 
     def cancel_job(self, job_id: str, timeout: float = 5.0) -> bool:
+        cooperative = False
         with self._lock:
             entry = self._store.get_job(job_id)
             if not entry or entry.get("status") in _TERMINAL_STATUSES:
@@ -1430,8 +1441,11 @@ class VirtualEnvSDK:
                         return False
                 if pid and not self._process_matches(pid, metadata):
                     # Never signal a persisted PGID after its launcher identity
-                    # is gone; the number may have been reused by another job.
-                    return False
+                    # is unavailable; the number may have been reused. New
+                    # launchers can instead acknowledge a job-local request.
+                    if not metadata.get("cooperative_cancel") or not metadata.get("cancel_path"):
+                        return False
+                    cooperative = True
             if entry.get("status") != "Canceling":
                 if not self._store.compare_and_set_job_status(
                     job_id, ("Pending", "Running"), "Canceling"
@@ -1444,7 +1458,18 @@ class VirtualEnvSDK:
                 job.status = "Canceling"
 
         try:
-            if pid:
+            if cooperative:
+                # Allow the launcher's TERM/KILL cleanup and durable status
+                # write to finish. Never report success solely from the request.
+                deadline = time.monotonic() + max(1.0, timeout) + 2.0
+                while True:
+                    exit_record = self._read_exit_record(metadata)
+                    if exit_record and exit_record.get("group_quiescent") is True:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Launcher did not acknowledge process-group cleanup")
+                    time.sleep(0.05)
+            elif pid:
                 self._terminate_process_group(pid, process=process, timeout=timeout)
         except Exception as exc:
             logger.warning(
