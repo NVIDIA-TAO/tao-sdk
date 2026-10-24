@@ -443,26 +443,26 @@ def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
         assert {"plan_id", "step_id", "instance_id"}.issubset(columns)
 
 
-def test_open_waits_for_reader_during_wal_transition(tmp_path):
-    """WAL conversion must tolerate a brief reader lock on a legacy database."""
-    import time
+def test_open_waits_for_initialization_lock(tmp_path):
+    """A second opener cannot enter schema initialization while the lock is held."""
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from tao_sdk.job_store import _exclusive_migration_lock
 
-    path = tmp_path / "reader.db"
-    reader = sqlite3.connect(path)
-    reader.execute("CREATE TABLE fixture (value INTEGER)")
-    reader.commit()
-    reader.execute("BEGIN")
-    reader.execute("SELECT * FROM fixture").fetchall()
+    path = tmp_path / "initializing.db"
+    entered = threading.Event()
+
+    def open_store():
+        entered.set()
+        return JobStore(path)
+
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(JobStore, path)
-        time.sleep(0.2)
-        reader.rollback()
-        reader.close()
+        with _exclusive_migration_lock(Path(str(path.resolve()) + ".init.lock")):
+            future = pool.submit(open_store)
+            assert entered.wait(timeout=5)
+            with pytest.raises(FutureTimeout):
+                future.result(timeout=0.2)
         store = future.result(timeout=10)
-        try:
-            assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        finally:
-            store.close()
+        store.close()
 
 
 def test_monitor_registration_never_replaces_concurrent_terminal_row(tmp_path):

@@ -1199,5 +1199,45 @@ def test_cooperative_cancel_requires_cleanup_acknowledgement(real_venv, tmp_path
         assert not recovered.cancel_job(job_id, timeout=0.01)
         assert recovered.get_job_status(job_id).status == "Canceling"
     # The real launcher acknowledged; a subsequent recovery can finalize it.
-    recovered.cancel_job(job_id, timeout=0.2)
+    # Normal status polling must reconcile a late acknowledgement, without
+    # requiring another cancellation request.
     assert recovered.get_job_status(job_id).status == "Canceled"
+
+
+def test_dead_recovered_launcher_does_not_claim_running(real_venv, tmp_path):
+    """A host-like group death cannot prove cleanup but must report it honestly."""
+    script = _write_script(tmp_path, "import time\ntime.sleep(60)\n")
+    work_dir, state_file = tmp_path / "dead", tmp_path / "dead.db"
+    job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
+    sdk = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
+    pid = int(sdk.get_job(job_id)["backend_job_id"])
+    os.killpg(pid, signal.SIGKILL)  # Exact group created by this test.
+    assert not sdk.cancel_job(job_id, timeout=0.01)
+    status = sdk.get_job_status(job_id)
+    assert status.status not in {"Canceled", "Complete", "Error"}
+    assert "quiescence" in status.message
+    assert "is running" not in status.message
+
+
+def test_wrapper_reaps_child_after_polling_exception(tmp_path, monkeypatch):
+    """Exceptional polling still reaps the child after group cleanup."""
+    namespace = {"__name__": "wrapper_test"}
+    exec(_JOB_WRAPPER_SOURCE, namespace)  # pylint: disable=exec-used
+    gate = tmp_path / "start"
+    gate.touch()
+    status = tmp_path / "exit.json"
+    monkeypatch.setattr(sys, "argv", [
+        "wrapper", str(status), str(tmp_path / "launch.json"), str(gate),
+        str(tmp_path / "cancel"), "unused-command",
+    ])
+    child = MagicMock()
+    child.poll.side_effect = KeyboardInterrupt("interrupted polling")
+    cleanup = MagicMock()
+    namespace["_stop_remaining_group_members"] = cleanup
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    assert namespace["main"]() == 127
+    cleanup.assert_called_once_with()
+    child.wait.assert_called_once_with()
+    record = json.loads(status.read_text())
+    assert record["group_quiescent"] is True
+    assert "KeyboardInterrupt" in record["error"]

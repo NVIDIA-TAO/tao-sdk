@@ -196,6 +196,7 @@ def main():
         })
         return 128 + signal.SIGTERM
     error = None
+    child = None
     try:
         child = subprocess.Popen(command)
         while child.poll() is None:
@@ -221,6 +222,8 @@ def main():
         error = f"{error}; {cleanup_error}" if error else cleanup_error
         if return_code == 0:
             return_code = 126
+    if child is not None and group_quiescent:
+        child.wait()  # Reap after cleanup even when the polling loop raised.
     _write_status(status_path, {
         "return_code": return_code,
         "error": error,
@@ -1307,8 +1310,11 @@ class VirtualEnvSDK:
             if process is not None:
                 return_code = process.poll()
                 if return_code is None:
-                    status = "Running"
-                    message = f"Process {process.pid} is running"
+                    status = "Canceling" if stored_status == "Canceling" else "Running"
+                    message = (
+                        "Cancellation requested; waiting for durable quiescence acknowledgement"
+                        if status == "Canceling" else f"Process {process.pid} is running"
+                    )
                 else:
                     status = self._finalize_after_process_group_quiescence(
                         job_id,
@@ -1322,8 +1328,10 @@ class VirtualEnvSDK:
                 status = entry.get("status", "Unknown")
                 metadata = self._read_metadata_from_entry(entry)
                 message = metadata.get("message", "")
-                if status in {"Pending", "Running"}:
-                    pid, metadata = self._resolve_process_identity(entry, metadata)
+                if status in {"Pending", "Running", "Canceling"}:
+                    pid, metadata = self._resolve_process_identity(
+                        entry, metadata, register=status != "Canceling"
+                    )
                     current_entry = self._store.get_job(job_id) or entry
                     current_status = current_entry.get("status", status)
                     if current_status in _TERMINAL_STATUSES:
@@ -1347,8 +1355,11 @@ class VirtualEnvSDK:
                             "message", ""
                         )
                     elif self._process_matches(pid, metadata):
-                        status = "Running"
-                        message = f"Process {pid} is running"
+                        status = "Canceling" if current_status == "Canceling" else "Running"
+                        message = (
+                            "Cancellation requested; waiting for durable quiescence acknowledgement"
+                            if status == "Canceling" else f"Process {pid} is running"
+                        )
                     elif status == "Pending" and pid == 0:
                         try:
                             launch_age = time.time() - float(
