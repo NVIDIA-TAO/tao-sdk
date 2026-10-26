@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ import pytest
 
 from tao_sdk.job_store import JobStore
 from tao_sdk.platforms.virtualenv import VirtualEnvSDK
+from tao_sdk.platforms.virtualenv.sdk import _JOB_WRAPPER_SOURCE
 
 
 @pytest.fixture(scope="module")
@@ -643,7 +645,7 @@ def test_post_spawn_registration_failure_reaps_process(
     real_popen = subprocess.Popen
 
     def tracking_popen(*args, **kwargs):
-        process = real_popen(*args, **kwargs)
+        process = real_popen(*args, **kwargs)  # pylint: disable=consider-using-with
         spawned.append(process)
         return process
 
@@ -671,7 +673,7 @@ def test_exception_immediately_after_spawn_is_rolled_back(
     real_popen = subprocess.Popen
 
     def tracking_popen(*args, **kwargs):
-        process = real_popen(*args, **kwargs)
+        process = real_popen(*args, **kwargs)  # pylint: disable=consider-using-with
         spawned.append(process)
         return process
 
@@ -923,7 +925,7 @@ def test_pending_record_recovers_if_orchestrator_crashes_after_spawn(
         "sdk._store.update_job_backend_id = lambda *a, **k: os._exit(23)\n"
         f"sdk.create_python_job(script={str(script)!r}, gpu_count=0)\n"
     )
-    crashed = subprocess.run([sys.executable, "-c", source])
+    crashed = subprocess.run([sys.executable, "-c", source], check=False)
     assert crashed.returncode == 23
 
     recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
@@ -955,7 +957,7 @@ def test_recovered_pending_job_can_cancel_without_opening_start_gate(
         "sdk._store.update_job_backend_id = lambda *a, **k: os._exit(25)\n"
         f"sdk.create_python_job(script={str(script)!r}, gpu_count=0)\n"
     )
-    crashed = subprocess.run([sys.executable, "-c", source])
+    crashed = subprocess.run([sys.executable, "-c", source], check=False)
     assert crashed.returncode == 25
 
     recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
@@ -996,7 +998,7 @@ def test_pending_record_stays_nonterminal_if_host_crashes_before_spawn(
         "sdk_module.subprocess.Popen = lambda *a, **k: os._exit(24)\n"
         f"sdk.create_python_job(script={str(script)!r}, gpu_count=0)\n"
     )
-    crashed = subprocess.run([sys.executable, "-c", source])
+    crashed = subprocess.run([sys.executable, "-c", source], check=False)
     assert crashed.returncode == 24
 
     monkeypatch.setattr(sdk_module, "_PENDING_LAUNCH_GRACE_SECONDS", 0.0)
@@ -1096,3 +1098,146 @@ def test_result_reader_rejects_directory_traversal(sdk):
     (sdk.jobs_dir / "path-test" / "results").mkdir(parents=True)
     with pytest.raises(ValueError, match="stay within"):
         sdk.read_job_result_file("path-test", "../metadata.json")
+
+
+def test_launcher_ps_fallback_does_not_count_its_own_helper():
+    # Without /proc (macOS) the launcher enumerates its group with `ps`; that
+    # helper shares the group and must not be reported as a leaked member.
+    harness = (
+        "import os, sys\n"
+        "real_scandir = os.scandir\n"
+        "def scandir(path='.'):\n"
+        "    if str(path) == '/proc':\n"
+        "        raise OSError('no /proc')\n"
+        "    return real_scandir(path)\n"
+        "os.scandir = scandir\n"
+        "namespace = {'__name__': 'launcher'}\n"
+        "exec(compile(sys.stdin.read(), 'launch_job.py', 'exec'), namespace)\n"
+        "print(namespace['_active_group_members']())\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", harness],
+        input=_JOB_WRAPPER_SOURCE,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        start_new_session=True,  # own process group: no other live members
+        check=True,
+    )
+
+    assert result.stdout.strip() == "[]"
+
+
+@pytest.mark.parametrize("return_code,background", [(0, False), (7, False), (0, True)])
+def test_real_job_ps_fallback_preserves_exit_and_cleans_workers(
+    sdk, tmp_path, monkeypatch, return_code, background
+):
+    """Exercise the generated launcher, real ps and workers, not mocked ps output."""
+    import tao_sdk.platforms.virtualenv.sdk as module
+
+    no_proc = (
+        "import os\n"
+        "_real_scandir = os.scandir\n"
+        "def _without_proc(path='.'):\n"
+        "    if str(path) == '/proc':\n"
+        "        raise FileNotFoundError('/proc unavailable')\n"
+        "    return _real_scandir(path)\n"
+        "os.scandir = _without_proc\n"
+    )
+    monkeypatch.setattr(module, "_JOB_WRAPPER_SOURCE", no_proc + module._JOB_WRAPPER_SOURCE)
+    script = _write_script(tmp_path,
+                           "import subprocess, sys\n" +
+                           ("subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                            if background else "") +
+                           f"sys.exit({return_code})\n")
+    job = sdk.create_python_job(script=script, gpu_count=0)
+    status_path = sdk.jobs_dir / job.id / "exit_status.json"
+    deadline = time.monotonic() + 15
+    while not status_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    record = json.loads(status_path.read_text())
+    assert record["group_quiescent"] is True, record
+    assert record["return_code"] == return_code, record
+    assert _wait_for_terminal(sdk, job.id).status == ("Error" if return_code else "Complete")
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_recovered_cancel_without_pid_identity_uses_launcher(
+    real_venv, tmp_path, monkeypatch, ignore_term
+):
+    script = _write_script(tmp_path,
+                           "import signal,time\n" +
+                           ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "") +
+                           "print('ready', flush=True)\ntime.sleep(60)\n")
+    work_dir, state_file = tmp_path / "jobs", tmp_path / "jobs.db"
+    job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
+    recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
+    deadline = time.monotonic() + 10
+    while "ready" not in recovered.get_job_logs(job_id):
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    monkeypatch.setattr(recovered, "_process_matches", lambda *args: False)
+
+    def forbidden_signal(*args, **kwargs):
+        pytest.fail("Must not signal a process group without verified identity")
+    monkeypatch.setattr(recovered, "_terminate_process_group", forbidden_signal)
+    assert recovered.cancel_job(job_id, timeout=0.2)
+    assert recovered.get_job_status(job_id).status == "Canceled"
+    record = json.loads((recovered.jobs_dir / job_id / "exit_status.json").read_text())
+    assert record["group_quiescent"] is True
+    assert record["return_code"] in {-signal.SIGTERM, -signal.SIGKILL}
+
+
+def test_cooperative_cancel_requires_cleanup_acknowledgement(real_venv, tmp_path, monkeypatch):
+    script = _write_script(tmp_path, "import time\ntime.sleep(60)\n")
+    work_dir, state_file = tmp_path / "jobs", tmp_path / "jobs.db"
+    job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
+    recovered = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
+    with monkeypatch.context() as patch:
+        patch.setattr(recovered, "_process_matches", lambda *args: False)
+        patch.setattr(recovered, "_read_exit_record", lambda *args: None)
+        assert not recovered.cancel_job(job_id, timeout=0.01)
+        assert recovered.get_job_status(job_id).status == "Canceling"
+    # The real launcher acknowledged; a subsequent recovery can finalize it.
+    # Normal status polling must reconcile a late acknowledgement, without
+    # requiring another cancellation request.
+    assert recovered.get_job_status(job_id).status == "Canceled"
+
+
+def test_dead_recovered_launcher_does_not_claim_running(real_venv, tmp_path):
+    """A host-like group death cannot prove cleanup but must report it honestly."""
+    script = _write_script(tmp_path, "import time\ntime.sleep(60)\n")
+    work_dir, state_file = tmp_path / "dead", tmp_path / "dead.db"
+    job_id = _launch_from_short_lived_process(real_venv, work_dir, state_file, script)
+    sdk = VirtualEnvSDK(real_venv, work_dir=work_dir, state_file=state_file)
+    pid = int(sdk.get_job(job_id)["backend_job_id"])
+    os.killpg(pid, signal.SIGKILL)  # Exact group created by this test.
+    assert not sdk.cancel_job(job_id, timeout=0.01)
+    status = sdk.get_job_status(job_id)
+    assert status.status not in {"Canceled", "Complete", "Error"}
+    assert "quiescence" in status.message
+    assert "is running" not in status.message
+
+
+def test_wrapper_reaps_child_after_polling_exception(tmp_path, monkeypatch):
+    """Exceptional polling still reaps the child after group cleanup."""
+    namespace = {"__name__": "wrapper_test"}
+    exec(_JOB_WRAPPER_SOURCE, namespace)  # pylint: disable=exec-used
+    gate = tmp_path / "start"
+    gate.touch()
+    status = tmp_path / "exit.json"
+    monkeypatch.setattr(sys, "argv", [
+        "wrapper", str(status), str(tmp_path / "launch.json"), str(gate),
+        str(tmp_path / "cancel"), "unused-command",
+    ])
+    child = MagicMock()
+    child.poll.side_effect = KeyboardInterrupt("interrupted polling")
+    cleanup = MagicMock()
+    namespace["_stop_remaining_group_members"] = cleanup
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    assert namespace["main"]() == 127
+    cleanup.assert_called_once_with()
+    child.wait.assert_called_once_with()
+    record = json.loads(status.read_text())
+    assert record["group_quiescent"] is True
+    assert "KeyboardInterrupt" in record["error"]

@@ -19,7 +19,7 @@ import sqlite3
 import stat
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -79,7 +79,7 @@ def _prepare_private_state_dir(state_dir: Path) -> None:
 
 @contextmanager
 def _exclusive_migration_lock(lock_path: Path):
-    """Hold a cross-process lock while importing cwd-relative legacy state."""
+    """Hold a cross-process lock across database initialization or migration."""
     with lock_path.open("a+b") as lock_file:
         if _fcntl is not None:
             _fcntl.flock(lock_file.fileno(), _fcntl.LOCK_EX)
@@ -108,8 +108,8 @@ def _exclusive_migration_lock(lock_path: Path):
                 break
             except OSError as exc:
                 if (
-                    exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
-                    and getattr(exc, "winerror", None) != 33
+                    exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK} and
+                    getattr(exc, "winerror", None) != 33
                 ):
                     raise
                 time.sleep(0.05)
@@ -214,8 +214,8 @@ def merge_legacy_database(source_path: Path, db_path: Path) -> int:
                                 checkpoint["path"],
                                 int(checkpoint.get("epoch", 0) or 0),
                                 str(
-                                    checkpoint.get("format", "safetensors")
-                                    or "safetensors"
+                                    checkpoint.get("format", "safetensors") or
+                                    "safetensors"
                                 ),
                                 str(checkpoint.get("created_at", "") or _now()),
                             ),
@@ -238,8 +238,8 @@ def _migrate_legacy_default_state(state_path: Path, db_path: Path) -> None:
             (
                 path
                 for name in _LEGACY_STATE_FILES
-                if (path := Path.cwd() / name).is_file()
-                and path.resolve() != state_path.resolve()
+                if (path := Path.cwd() / name).is_file() and
+                path.resolve() != state_path.resolve()
             ),
             None,
         )
@@ -257,8 +257,8 @@ def _migrate_legacy_default_state(state_path: Path, db_path: Path) -> None:
         legacy_databases = [
             path
             for name in _LEGACY_DB_FILES
-            if (path := Path.cwd() / name).is_file()
-            and path.resolve() != db_path.resolve()
+            if (path := Path.cwd() / name).is_file() and
+            path.resolve() != db_path.resolve()
         ]
         if legacy_databases and not db_path.exists():
             legacy_db = legacy_databases.pop(0)
@@ -333,6 +333,7 @@ def resolve_sdk_state_paths(
     )
     return state_path, db_path
 
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
@@ -399,7 +400,7 @@ class JobStore:
 
     def __init__(self, db_path: str | os.PathLike[str] | None = None):
         if db_path is None:
-            _state_path, resolved_db_path = resolve_sdk_state_paths()
+            _, resolved_db_path = resolve_sdk_state_paths()
             db_path = resolved_db_path
         db_path = os.fspath(db_path)
         self._db_path = db_path
@@ -408,10 +409,23 @@ class JobStore:
             db_path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_SCHEMA)
-        self._migrate()
+        # Journal-mode conversion precedes SQLite migration transactions and
+        # can race with another opener's schema writes. Serialize the complete
+        # initialization boundary, not just ALTER TABLE. In-memory databases
+        # are private to their connections and need no filesystem sidecar.
+        initialization_lock = (
+            nullcontext() if db_path == ":memory:" else
+            _exclusive_migration_lock(Path(str(Path(db_path).resolve()) + ".init.lock"))
+        )
+        try:
+            with initialization_lock:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                self._conn.executescript(_SCHEMA)
+                self._migrate()
+        except BaseException:
+            self._conn.close()
+            raise
 
     @_locked_operation
     def _migrate(self) -> None:
@@ -699,7 +713,7 @@ class JobStore:
         job_id: str,
         path: str,
         epoch: int = 0,
-        format: str = "safetensors",
+        format: str = "safetensors",  # pylint: disable=redefined-builtin
     ) -> None:
         """Record a checkpoint produced by a job."""
         self._conn.execute(
@@ -900,7 +914,7 @@ class JobStore:
         if not path.exists():
             return 0
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 state = json.load(f)
         except (json.JSONDecodeError, KeyError):
             logger.warning("Failed to parse state file %s", state_file)

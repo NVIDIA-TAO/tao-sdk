@@ -422,7 +422,10 @@ def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
     connection.commit()
     connection.close()
 
+    ready = threading.Barrier(8)
+
     def open_store(_index):
+        ready.wait(timeout=10)
         store = JobStore(db_path)
         try:
             return {
@@ -434,10 +437,32 @@ def test_concurrent_open_migrates_shared_legacy_schema_once(tmp_path):
         finally:
             store.close()
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(open_store, range(2)))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(open_store, range(8)))
     for columns in results:
         assert {"plan_id", "step_id", "instance_id"}.issubset(columns)
+
+
+def test_open_waits_for_initialization_lock(tmp_path):
+    """A second opener cannot enter schema initialization while the lock is held."""
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from tao_sdk.job_store import _exclusive_migration_lock
+
+    path = tmp_path / "initializing.db"
+    entered = threading.Event()
+
+    def open_store():
+        entered.set()
+        return JobStore(path)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with _exclusive_migration_lock(Path(str(path.resolve()) + ".init.lock")):
+            future = pool.submit(open_store)
+            assert entered.wait(timeout=5)
+            with pytest.raises(FutureTimeout):
+                future.result(timeout=0.2)
+        store = future.result(timeout=10)
+        store.close()
 
 
 def test_monitor_registration_never_replaces_concurrent_terminal_row(tmp_path):
@@ -819,7 +844,7 @@ def test_slurm_launch_fence_is_single_owner_and_terminal_status_blocks_retry(
     first_handler._begin_launch_fence("job-1")  # noqa: SLF001
     second_handler.check_path_exists = MagicMock(return_value=True)
     second_handler._ssh = MagicMock()  # noqa: SLF001
-    success, _scheduler_id, message = second_handler._resubmit_failed_job(  # noqa: SLF001
+    success, _, message = second_handler._resubmit_failed_job(  # noqa: SLF001
         "job-1", failed_slurm_job_id="42", retry_count=0,
     )
     assert success is False

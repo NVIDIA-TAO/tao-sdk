@@ -92,18 +92,20 @@ def _active_group_members():
     try:
         proc_entries = os.scandir("/proc")
     except OSError:
-        result = subprocess.run(
+        # The ps helper shares this process group; track its pid so it is not
+        # reported as a leaked group member.
+        ps_proc = subprocess.Popen(
             ["ps", "-eo", "pid=,pgid=,stat="],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=False,
         )
-        if result.returncode != 0:
+        ps_out, ps_err = ps_proc.communicate()
+        if ps_proc.returncode != 0:
             raise RuntimeError(
-                "cannot enumerate process group: " + result.stderr.strip()
+                "cannot enumerate process group: " + ps_err.strip()
             )
-        for line in result.stdout.splitlines():
+        for line in ps_out.splitlines():
             fields = line.split()
             if len(fields) < 3:
                 continue
@@ -113,7 +115,7 @@ def _active_group_members():
             except ValueError:
                 continue
             state = fields[2]
-            if pid != own_pid and process_group == group_id and not state.startswith("Z"):
+            if pid not in (own_pid, ps_proc.pid) and process_group == group_id and not state.startswith("Z"):
                 members.append(pid)
         return members
     with proc_entries:
@@ -194,8 +196,18 @@ def main():
         })
         return 128 + signal.SIGTERM
     error = None
+    child = None
     try:
-        return_code = subprocess.call(command)
+        child = subprocess.Popen(command)
+        while child.poll() is None:
+            if os.path.exists(cancel_path):
+                # The launcher owns this live group. A recovered controller
+                # need not identify or signal a persisted numeric PID.
+                _stop_remaining_group_members()
+                child.wait()
+                break
+            time.sleep(0.05)
+        return_code = child.returncode
     except BaseException as exc:  # Preserve a durable failure record.
         traceback.print_exc()
         return_code = 127
@@ -210,6 +222,8 @@ def main():
         error = f"{error}; {cleanup_error}" if error else cleanup_error
         if return_code == 0:
             return_code = 126
+    if child is not None and group_quiescent:
+        child.wait()  # Reap after cleanup even when the polling loop raised.
     _write_status(status_path, {
         "return_code": return_code,
         "error": error,
@@ -360,9 +374,9 @@ def _read_tail(
         newline_count = 0
         bytes_read = 0
         while (
-            remaining > 0
-            and newline_count <= line_count
-            and bytes_read < max_bytes
+            remaining > 0 and
+            newline_count <= line_count and
+            bytes_read < max_bytes
         ):
             size = min(block_size, remaining, max_bytes - bytes_read)
             remaining -= size
@@ -405,7 +419,7 @@ class VirtualEnvSDK:
         self.python_path = self.venv_path / "bin" / "python"
         using_default_layout = work_dir is None and state_file is None
         if work_dir is None:
-            default_state_file, _default_db = resolve_sdk_state_paths()
+            default_state_file, _ = resolve_sdk_state_paths()
             resolved_work_dir = Path(default_state_file).parent / "virtualenv"
         else:
             resolved_work_dir = Path(work_dir).expanduser()
@@ -423,8 +437,8 @@ class VirtualEnvSDK:
         if using_default_layout:
             legacy_db = Path.cwd() / ".tao" / "virtualenv" / "tao_session.db"
             if (
-                legacy_db.is_file()
-                and legacy_db.resolve() != raw_state_path.resolve()
+                legacy_db.is_file() and
+                legacy_db.resolve() != raw_state_path.resolve()
             ):
                 imported = merge_legacy_database(
                     legacy_db,
@@ -584,6 +598,7 @@ class VirtualEnvSDK:
             "exit_record_path": str(exit_record_path),
             "start_gate_path": str(start_gate_path),
             "cancel_path": str(cancel_path),
+            "cooperative_cancel": True,
             "cwd": str(launch_cwd),
             "venv_path": str(self.venv_path),
             "config_path": str(config_path),
@@ -629,7 +644,7 @@ class VirtualEnvSDK:
         try:
             log_file = log_path.open("ab", buffering=0)
             try:
-                process = subprocess.Popen(
+                process = subprocess.Popen(  # pylint: disable=consider-using-with
                     launcher_argv,
                     cwd=str(launch_cwd),
                     env=process_env,
@@ -1008,7 +1023,7 @@ class VirtualEnvSDK:
             raise ValueError("config_format must be one of: json, yaml, toml")
         if normalized == "toml":
             try:
-                import tomli_w  # noqa: F401
+                import tomli_w  # noqa: F401  # pylint: disable=unused-import
             except ImportError as exc:
                 raise RuntimeError(
                     "TOML spec serialization requires an optional writer. "
@@ -1128,18 +1143,18 @@ class VirtualEnvSDK:
         """Merge the durable launcher identity into store metadata."""
         launcher_record = self._read_launcher_record(metadata) or {}
         pid_value = (
-            entry.get("backend_job_id")
-            or metadata.get("pid")
-            or launcher_record.get("pid")
-            or 0
+            entry.get("backend_job_id") or
+            metadata.get("pid") or
+            launcher_record.get("pid") or
+            0
         )
         try:
             pid = int(pid_value)
         except (TypeError, ValueError):
             pid = 0
         marker = (
-            metadata.get("process_start_marker")
-            or launcher_record.get("process_start_marker")
+            metadata.get("process_start_marker") or
+            launcher_record.get("process_start_marker")
         )
         attach_allowed = True
         if register and pid and not entry.get("backend_job_id"):
@@ -1147,8 +1162,8 @@ class VirtualEnvSDK:
                 entry["job_id"], str(pid), "Running"
             )
         if (
-            pid
-            and (metadata.get("pid") != pid or not metadata.get("process_start_marker"))
+            pid and
+            (metadata.get("pid") != pid or not metadata.get("process_start_marker"))
         ):
             metadata.update({
                 "pid": pid,
@@ -1206,9 +1221,9 @@ class VirtualEnvSDK:
                 cancel_path and Path(cancel_path).exists()
             )
             if (
-                previous in {"Canceling", "Canceled"}
-                or cancel_requested
-                or job_id in self._canceled
+                previous in {"Canceling", "Canceled"} or
+                cancel_requested or
+                job_id in self._canceled
             ):
                 proposed_status = "Canceled"
                 proposed_message = "Process group was canceled"
@@ -1270,6 +1285,7 @@ class VirtualEnvSDK:
         return status
 
     def get_job_status(self, job_id: str) -> JobStatus:
+        """Reconcile durable job state with the launcher and its exit record."""
         with self._lock:
             entry = self._store.get_job(job_id)
             if not entry:
@@ -1278,8 +1294,8 @@ class VirtualEnvSDK:
             if stored_status in _TERMINAL_STATUSES:
                 metadata = self._read_metadata_from_entry(entry)
                 message = (
-                    metadata.get("message")
-                    or _TERMINAL_STATUS_MESSAGES[stored_status]
+                    metadata.get("message") or
+                    _TERMINAL_STATUS_MESSAGES[stored_status]
                 )
                 if metadata.get("status") != stored_status:
                     message = _TERMINAL_STATUS_MESSAGES[stored_status]
@@ -1294,8 +1310,11 @@ class VirtualEnvSDK:
             if process is not None:
                 return_code = process.poll()
                 if return_code is None:
-                    status = "Running"
-                    message = f"Process {process.pid} is running"
+                    status = "Canceling" if stored_status == "Canceling" else "Running"
+                    message = (
+                        "Cancellation requested; waiting for durable quiescence acknowledgement"
+                        if status == "Canceling" else f"Process {process.pid} is running"
+                    )
                 else:
                     status = self._finalize_after_process_group_quiescence(
                         job_id,
@@ -1309,8 +1328,10 @@ class VirtualEnvSDK:
                 status = entry.get("status", "Unknown")
                 metadata = self._read_metadata_from_entry(entry)
                 message = metadata.get("message", "")
-                if status in {"Pending", "Running"}:
-                    pid, metadata = self._resolve_process_identity(entry, metadata)
+                if status in {"Pending", "Running", "Canceling"}:
+                    pid, metadata = self._resolve_process_identity(
+                        entry, metadata, register=status != "Canceling"
+                    )
                     current_entry = self._store.get_job(job_id) or entry
                     current_status = current_entry.get("status", status)
                     if current_status in _TERMINAL_STATUSES:
@@ -1334,8 +1355,11 @@ class VirtualEnvSDK:
                             "message", ""
                         )
                     elif self._process_matches(pid, metadata):
-                        status = "Running"
-                        message = f"Process {pid} is running"
+                        status = "Canceling" if current_status == "Canceling" else "Running"
+                        message = (
+                            "Cancellation requested; waiting for durable quiescence acknowledgement"
+                            if status == "Canceling" else f"Process {pid} is running"
+                        )
                     elif status == "Pending" and pid == 0:
                         try:
                             launch_age = time.time() - float(
@@ -1358,6 +1382,7 @@ class VirtualEnvSDK:
             return JobStatus(job_id=job_id, status=status, message=message)
 
     def get_job_logs(self, job_id: str, tail: int | None = None) -> str:
+        """Read captured job output, optionally restricted to its tail."""
         with self._lock:
             entry = self._store.get_job(job_id)
         if not entry:
@@ -1392,6 +1417,8 @@ class VirtualEnvSDK:
                 yield chunk
 
     def cancel_job(self, job_id: str, timeout: float = 5.0) -> bool:
+        """Request cancellation and confirm worker cleanup before success."""
+        cooperative = False
         with self._lock:
             entry = self._store.get_job(job_id)
             if not entry or entry.get("status") in _TERMINAL_STATUSES:
@@ -1428,8 +1455,11 @@ class VirtualEnvSDK:
                         return False
                 if pid and not self._process_matches(pid, metadata):
                     # Never signal a persisted PGID after its launcher identity
-                    # is gone; the number may have been reused by another job.
-                    return False
+                    # is unavailable; the number may have been reused. New
+                    # launchers can instead acknowledge a job-local request.
+                    if not metadata.get("cooperative_cancel") or not metadata.get("cancel_path"):
+                        return False
+                    cooperative = True
             if entry.get("status") != "Canceling":
                 if not self._store.compare_and_set_job_status(
                     job_id, ("Pending", "Running"), "Canceling"
@@ -1442,7 +1472,18 @@ class VirtualEnvSDK:
                 job.status = "Canceling"
 
         try:
-            if pid:
+            if cooperative:
+                # Allow the launcher's TERM/KILL cleanup and durable status
+                # write to finish. Never report success solely from the request.
+                deadline = time.monotonic() + max(1.0, timeout) + 2.0
+                while True:
+                    exit_record = self._read_exit_record(metadata)
+                    if exit_record and exit_record.get("group_quiescent") is True:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Launcher did not acknowledge process-group cleanup")
+                    time.sleep(0.05)
+            elif pid:
                 self._terminate_process_group(pid, process=process, timeout=timeout)
         except Exception as exc:
             logger.warning(
@@ -1483,6 +1524,7 @@ class VirtualEnvSDK:
         return True
 
     def get_failure_analysis(self, job_id: str) -> dict | None:
+        """Return diagnostics for a failed job, or None for other states."""
         status = self.get_job_status(job_id)
         if status.status != "Error":
             return None
@@ -1516,11 +1558,13 @@ class VirtualEnvSDK:
     # ------------------------------------------------------------------
 
     def get_job(self, job_id: str) -> dict | None:
+        """Refresh and return a persisted job."""
         self.get_job_status(job_id)
         with self._lock:
             return self._store.get_job(job_id)
 
     def list_jobs(self, status: str | None = None) -> list[dict]:
+        """Refresh owned processes and list persisted jobs."""
         with self._lock:
             active_job_ids = list(self._processes)
         for job_id in active_job_ids:
@@ -1529,6 +1573,7 @@ class VirtualEnvSDK:
             return self._store.list_jobs(status=status)
 
     def get_job_results_dir(self, job_id: str) -> str:
+        """Return the job's recorded local results directory."""
         with self._lock:
             entry = self._store.get_job(job_id)
         return entry.get("local_results_dir", "") if entry else ""
@@ -1557,6 +1602,7 @@ class VirtualEnvSDK:
             return False
 
     def list_results(self, job_id: str) -> list[str]:
+        """List files relative to the job's results directory."""
         results_dir = self.get_job_results_dir(job_id)
         if not results_dir:
             return []
@@ -1574,6 +1620,7 @@ class VirtualEnvSDK:
         return self.list_results(job_id)
 
     def read_job_result_file(self, job_id: str, relative_path: str) -> str:
+        """Read a text result without allowing paths outside the job."""
         results_dir = self.get_job_results_dir(job_id)
         if not results_dir:
             return ""
@@ -1588,6 +1635,7 @@ class VirtualEnvSDK:
         return candidate.read_text(encoding="utf-8", errors="replace")
 
     def get_checkpoints(self, job_id: str) -> list[str]:
+        """List result files with known checkpoint extensions."""
         return [
             path for path in self.list_results(job_id)
             if path.lower().endswith(_CHECKPOINT_EXTENSIONS)
